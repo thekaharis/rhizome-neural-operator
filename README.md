@@ -8,6 +8,34 @@ explicit energy.
 It is independent of `fno-21cm` (no imports or shared files), but reads the same
 raw lightcones.
 
+## Rhizome neural operator
+
+Alongside the EBM, `ebm21cm.model.rhizome.RhizomeOperator2d` makes the recurrent
+cell-to-cell interaction itself a **state-dependent integral operator**.
+Learned source and receiver gates surround a periodic interaction kernel;
+Fourier coefficients parameterize that kernel, and an FFT evaluates the
+connections efficiently. There is **no separate additive FNO or local-convolution
+message branch**. All cells update synchronously with shared weights.
+
+The original additive local + Fourier model, `RecurrentFNO2d`, remains available
+as a baseline. Both architectures have an untied, same-width/update-count
+comparison, and older additive checkpoints still load.
+
+`python -m ebm21cm.train_recurrent` trains this model on the same slice cache,
+selects checkpoints using validation cones, and evaluates held-out test cones.
+This first experiment is **deterministic x_HI regression**, not a calibrated
+stochastic generator or a coherent 3-D lightcone model. It leaves the EBM
+training and sampling commands below unchanged.
+
+See [the rhizome guide](docs/rhizome_operator.md) for the interaction equations,
+reproducible toy comparison, results, and limitations. The
+[original recurrent-operator guide](docs/recurrent_operator.md) documents the
+additive baseline and its first pilot.
+
+For long training, `python -m ebm21cm.train_rhizome` adds validation-driven
+learning-rate reductions, an explicit plateau stopping rule, and resumable
+checkpoints. See [the long-training protocol](docs/rhizome_long_training.md).
+
 ## Why
 
 A deterministic regressor trained with a pointwise loss predicts the conditional
