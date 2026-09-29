@@ -103,3 +103,35 @@ def energy_gaps(path, sigmas, gaps: dict):
     fig.savefig(path, dpi=120)
     plt.close(fig)
     return Path(path)
+
+
+def regression_examples(path, delta, truth, pred, z, title=None):
+    """Rows = slices. Columns: density band | x_HI truth | prediction | prediction - truth.
+
+    Each row is labelled with z, the slice-mean x_HI of truth and prediction, and the slice RMSE.
+    """
+    n = len(z)
+    fig, axes = plt.subplots(n, 4, figsize=(9.2, 2.3 * n + 0.5), squeeze=False)
+    names = ("density (log 1+δ)", "x_HI truth", "x_HI prediction", "prediction − truth")
+    for i in range(n):
+        rmse = float(np.sqrt(np.mean((pred[i] - truth[i]) ** 2)))
+        panels = ((np.log1p(np.maximum(delta[i], -0.99)), "cividis", None, None),
+                  (truth[i], "Greys", 0, 1), (pred[i], "Greys", 0, 1),
+                  (pred[i] - truth[i], "RdBu_r", -1, 1))
+        for j, (image, cmap, vmin, vmax) in enumerate(panels):
+            ax = axes[i, j]
+            im = ax.imshow(image, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if i == 0:
+                ax.set_title(names[j], fontsize=9)
+            if j == 3:
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+        axes[i, 0].set_ylabel(f"z={z[i]:.2f}\n<x>={truth[i].mean():.2f}|{pred[i].mean():.2f}\n"
+                              f"rmse {rmse:.3f}", fontsize=8)
+    if title:
+        fig.suptitle(title, fontsize=10)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    return Path(path)

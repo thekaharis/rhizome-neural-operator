@@ -102,17 +102,55 @@ def assign_splits(cone_ids, seed: int, fractions=(0.8, 0.1, 0.1)) -> dict[int, i
     return split
 
 
-def pick_indices(z: np.ndarray, below: int, above: int, k: int, z_range, rng) -> np.ndarray:
-    """k LOS indices, stratified in index over the admissible range."""
+def admissible_indices(z: np.ndarray, below: int, above: int, z_range) -> np.ndarray:
     idx = np.arange(below, len(z) - above)
     if z_range is not None:
         idx = idx[(z[idx] >= z_range[0]) & (z[idx] <= z_range[1])]
-    if idx.size == 0:
-        return idx
+    return idx
+
+
+def stratified(idx: np.ndarray, k: int, rng) -> np.ndarray:
+    """k entries of ``idx``, one drawn uniformly from each of k equal index strata."""
     if idx.size <= k:
         return idx
     edges = np.linspace(0, idx.size, k + 1).astype(int)
     return np.array([idx[rng.integers(a, b)] for a, b in zip(edges[:-1], edges[1:]) if b > a])
+
+
+def pick_indices(z: np.ndarray, below: int, above: int, k: int, z_range, rng) -> np.ndarray:
+    """k LOS indices, stratified in index over the admissible range."""
+    return stratified(admissible_indices(z, below, above, z_range), k, rng)
+
+
+def stratified_levels(idx: np.ndarray, values: np.ndarray, k: int, rng) -> np.ndarray:
+    """Up to k entries of ``idx`` whose ``values`` best match k stratified random levels.
+
+    Levels are drawn one per equal-width stratum of [min, max] of ``values[idx]``,
+    so the picks cover the value range evenly however slowly it changes along
+    the LOS. Duplicate matches (steep jumps) are dropped rather than replaced.
+    """
+    if idx.size <= k:
+        return idx
+    v = values[idx]
+    edges = np.linspace(v.min(), v.max(), k + 1)
+    levels = rng.uniform(edges[:-1], edges[1:])
+    return np.unique(idx[np.abs(v[None, :] - levels[:, None]).argmin(axis=1)])
+
+
+def pick_window_indices(z, history, below, above, k, k_background, window, z_range, rng) -> np.ndarray:
+    """k indices inside the cone's own reionization window, plus k_background outside it.
+
+    ``history`` is the mean x_HI per LOS index. Inside
+    ``window[0] <= history <= window[1]`` the rows are stratified in x_HI, not
+    in LOS index: the history approaches 1 slowly at high z, and index strata
+    would pile up early-phase slices. The remaining admissible indices are
+    stratified in index. A cone that never enters the window contributes
+    background slices only.
+    """
+    idx = admissible_indices(z, below, above, z_range)
+    inside = (history[idx] >= window[0]) & (history[idx] <= window[1])
+    picked = [stratified_levels(idx[inside], history, k, rng), stratified(idx[~inside], k_background, rng)]
+    return np.sort(np.concatenate(picked)).astype(np.int64)
 
 
 # ---------------------------------------------------------------- build
@@ -126,8 +164,25 @@ def discover(data: str | Path, pattern: str) -> list[Path]:
 
 def build(files, out, slices_per_cone=8, bands=DEFAULT_BANDS, z_range=None, split_seed=42,
           param_names=DEFAULT_PARAM_NAMES, missing_params="raise", dtype="float16",
-          shard=0, n_shards=1, sample_seed=0, compute_stats_after=True, log=print):
+          shard=0, n_shards=1, sample_seed=0, compute_stats_after=True, log=print,
+          xhi_window=None, background_slices=0, chunk_cache_bytes=None, tb_overflow="skip"):
+    """``xhi_window=(lo, hi)`` concentrates ``slices_per_cone`` rows on the LOS
+    indices where the cone's mean x_HI lies in [lo, hi] and adds
+    ``background_slices`` rows from the rest of the admissible range. Without
+    it, ``slices_per_cone`` rows are stratified over the whole range.
+
+    ``tb_overflow="clip"`` keeps cones whose sampled T_b exceeds the float16
+    range, clipping T_b to +-6e4 mK and listing them in the ``tb_clipped``
+    attribute (their T_b is then excluded from the /stats normalization).
+    The default ``"skip"`` drops such cones. x_HI and density are never clipped.
+    """
+    if tb_overflow not in ("skip", "clip"):
+        raise ValueError("tb_overflow must be 'skip' or 'clip'")
     files = [Path(f) for f in files]
+    if xhi_window is not None:
+        xhi_window = tuple(float(v) for v in xhi_window)
+        if len(xhi_window) != 2 or not 0 <= xhi_window[0] <= xhi_window[1] <= 1:
+            raise ValueError("xhi_window must be (lo, hi) with 0 <= lo <= hi <= 1")
     bands_l = parse_bands(bands) if isinstance(bands, str) else [tuple(b) for b in bands]
     below, above = band_extent(bands_l)
     ids = cone_ids_for(files)
@@ -141,12 +196,12 @@ def build(files, out, slices_per_cone=8, bands=DEFAULT_BANDS, z_range=None, spli
     store_dtype = np.dtype(dtype)
     n_rows = 0
     geometry = None
-    skipped = []
+    skipped, tb_clipped = [], []
     with h5py.File(tmp, "w") as h:
         dsets = {}
         for f, cid in mine:
             try:
-                with Lightcone(f) as lc:
+                with Lightcone(f, chunk_cache_bytes) as lc:
                     H, W = lc.shape_hw
                     geo = (H, W, round(lc.cell_size, 6))
                     if geometry is None:
@@ -173,7 +228,12 @@ def build(files, out, slices_per_cone=8, bands=DEFAULT_BANDS, z_range=None, spli
                         continue
                     params = lc.params(param_names, missing=missing_params)
                     rng = np.random.default_rng([sample_seed, cid])
-                    idx = pick_indices(lc.redshifts, below, above, slices_per_cone, z_range, rng)
+                    if xhi_window is None:
+                        idx = pick_indices(lc.redshifts, below, above, slices_per_cone, z_range, rng)
+                    else:
+                        idx = pick_window_indices(lc.redshifts, lc.xhi_history(), below, above,
+                                                  slices_per_cone, background_slices, xhi_window,
+                                                  z_range, rng)
                     if idx.size == 0:
                         skipped.append((str(f), "no admissible LOS index"))
                         continue
@@ -183,12 +243,15 @@ def build(files, out, slices_per_cone=8, bands=DEFAULT_BANDS, z_range=None, spli
                         rows["delta"].append(band_means(block, below, bands_l))
                         rows["xhi"].append(lc.read_range("neutral_fraction", i, i + 1)[0])
                         rows["tb"].append(lc.read_range("brightness_temp", i, i + 1)[0])
-                    for k, v in rows.items():
+                    clipped = False
+                    for k, v in list(rows.items()):
                         v = np.stack(v)
                         if not np.all(np.isfinite(v)):
                             raise ValueError(f"non-finite {k}")
                         if store_dtype == np.float16 and np.abs(v).max() > 6.0e4:
-                            raise ValueError(f"{k} overflows float16")
+                            if k != "tb" or tb_overflow != "clip":
+                                raise ValueError(f"{k} overflows float16")
+                            rows[k], clipped = np.clip(v, -6.0e4, 6.0e4), True
                     dz = np.gradient(lc.distances)
                     n = idx.size
                     extra = {
@@ -204,6 +267,8 @@ def build(files, out, slices_per_cone=8, bands=DEFAULT_BANDS, z_range=None, spli
                 ds.resize(n_rows + n, axis=0)
                 ds[n_rows:n_rows + n] = np.asarray(v).astype(ds.dtype)
             n_rows += n
+            if clipped:
+                tb_clipped.append(int(cid))
             log(f"cone {cid}: {n} slices, z {extra['z'].min():.2f}-{extra['z'].max():.2f}, "
                 f"split {split_of[cid]}")
         if geometry is None:
@@ -213,12 +278,16 @@ def build(files, out, slices_per_cone=8, bands=DEFAULT_BANDS, z_range=None, spli
             "cell_size_mpc": geometry[2], "shape": json.dumps(geometry[:2]),
             "split_seed": split_seed, "sample_seed": sample_seed, "slices_per_cone": slices_per_cone,
             "z_range": json.dumps(z_range), "shard": shard, "n_shards": n_shards,
+            "xhi_window": json.dumps(xhi_window), "background_slices": int(background_slices),
             "sources": json.dumps([str(f) for f, _ in mine]), "skipped": json.dumps(skipped),
+            "tb_clipped": json.dumps(tb_clipped),
             "split_of": json.dumps({str(k): v for k, v in split_of.items()}),
         })
     os.replace(tmp, out)
     for f, why in skipped:
         log(f"skipped {f}: {why}")
+    if tb_clipped:
+        log(f"T_b clipped to float16 range in cones {tb_clipped}")
     log(f"wrote {n_rows} rows to {out}")
     if compute_stats_after and n_shards == 1:
         write_stats(out, log=log)
@@ -229,15 +298,16 @@ def merge(shards, out, log=print):
     shards = [Path(s) for s in shards]
     keys = ("delta", "xhi", "tb", "z", "los_index", "los_spacing_mpc", "cone_id", "split", "params")
     fixed = ("schema", "bands", "param_names", "cell_size_mpc", "shape", "split_seed",
-             "sample_seed", "slices_per_cone", "z_range", "split_of")
+             "sample_seed", "slices_per_cone", "z_range", "split_of", "xhi_window", "background_slices")
     with h5py.File(shards[0], "r") as h0:
-        ref = {a: h0.attrs[a] for a in fixed}
+        # Caches written before the reionization-window option lack its attributes.
+        ref = {a: h0.attrs[a] for a in fixed if a in h0.attrs}
         like = {k: (h0[k].shape[1:], h0[k].dtype, h0[k].chunks) for k in keys}
     seen, total = set(), 0
     for s in shards:
         with h5py.File(s, "r") as h:
             for a in fixed:
-                if h.attrs[a] != ref[a]:
+                if a in ref and h.attrs.get(a) != ref[a]:
                     raise ValueError(f"{s}: attribute {a} differs from {shards[0]}")
             ids = set(np.unique(h["cone_id"][:]).tolist())
             if ids & seen:
@@ -250,7 +320,7 @@ def merge(shards, out, log=print):
         for k, (shape, dt, chunks) in like.items():
             chunks = (min(chunks[0], max(total, 1)), *chunks[1:]) if chunks else None
             o.create_dataset(k, shape=(total, *shape), dtype=dt, chunks=chunks)
-        pos, sources, skipped = 0, [], []
+        pos, sources, skipped, tb_clipped = 0, [], [], []
         for s in shards:
             with h5py.File(s, "r") as h:
                 n = h["z"].shape[0]
@@ -260,9 +330,11 @@ def merge(shards, out, log=print):
                         o[k][pos + a:pos + b] = h[k][a:b]
                 sources += json.loads(h.attrs["sources"])
                 skipped += json.loads(h.attrs["skipped"])
+                tb_clipped += json.loads(h.attrs.get("tb_clipped", "[]"))
                 pos += n
         o.attrs.update(ref)
         o.attrs.update({"sources": json.dumps(sources), "skipped": json.dumps(skipped),
+                        "tb_clipped": json.dumps(tb_clipped),
                         "shard": 0, "n_shards": 1, "merged_from": json.dumps([str(s) for s in shards])})
     os.replace(tmp, out)
     log(f"merged {len(shards)} shards, {total} rows -> {out}")
@@ -282,12 +354,16 @@ def write_stats(path, chunk=256, log=print):
         train = np.flatnonzero(h["split"][:] == 0)
         if train.size == 0:
             raise ValueError("no training rows")
+        # Clipped T_b values are not physical; keep them out of its normalization.
+        clipped = np.isin(h["cone_id"][:][train], json.loads(h.attrs.get("tb_clipped", "[]")))
         acc = {k: [0.0, 0.0, 0] for k in ("delta", "tb")}
         xhi_acc = [0.0, 0.0, 0]
         for a in range(0, train.size, chunk):
             rows = train[a:a + chunk]
             for key, fn in (("delta", delta_transform), ("tb", lambda v: v)):
                 v = fn(h[key][rows].astype(np.float64))
+                if key == "tb":
+                    v = v[~clipped[a:a + chunk]]
                 acc[key][0] += v.sum()
                 acc[key][1] += (v ** 2).sum()
                 acc[key][2] += v.size
@@ -476,6 +552,14 @@ def main(argv=None):
     b.add_argument("--shard", type=int, default=0)
     b.add_argument("--n-shards", type=int, default=1)
     b.add_argument("--limit", type=int, help="use only the first N files (pilot runs)")
+    b.add_argument("--xhi-window", help="'lo,hi': sample --slices-per-cone rows where the cone's "
+                   "mean x_HI lies in [lo, hi] (e.g. 0.02,0.98)")
+    b.add_argument("--background-slices", type=int, default=0,
+                   help="with --xhi-window: extra rows stratified over the rest of the cone")
+    b.add_argument("--tb-overflow", choices=("skip", "clip"), default="skip",
+                   help="cones whose T_b exceeds float16: drop them, or clip T_b and keep them")
+    b.add_argument("--chunk-cache-mb", type=int, default=1024,
+                   help="HDF5 chunk cache per dataset while reading lightcones")
     m = sub.add_parser("merge", help="merge shards and compute stats")
     m.add_argument("--out", required=True)
     m.add_argument("shards", nargs="+")
@@ -489,9 +573,12 @@ def main(argv=None):
             files = files[:a.limit]
         zr = None if a.z_min is None and a.z_max is None else (
             a.z_min if a.z_min is not None else -np.inf, a.z_max if a.z_max is not None else np.inf)
+        window = tuple(float(v) for v in a.xhi_window.split(",")) if a.xhi_window else None
         build(files, a.out, a.slices_per_cone, a.bands, zr, a.split_seed,
               tuple(n for n in a.param_names.split(",") if n), a.missing_params, a.dtype,
-              a.shard, a.n_shards, a.sample_seed)
+              a.shard, a.n_shards, a.sample_seed, xhi_window=window,
+              background_slices=a.background_slices, chunk_cache_bytes=a.chunk_cache_mb * 2**20,
+              tb_overflow=a.tb_overflow)
     elif a.cmd == "merge":
         merge(a.shards, a.out)
     else:

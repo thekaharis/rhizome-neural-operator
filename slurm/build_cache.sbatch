@@ -32,6 +32,13 @@ SLICES_PER_CONE="${SLICES_PER_CONE:-8}"
 BANDS="${BANDS:--32:-16,-16:-8,-8:-4,-3,-2,-1,0,1,2,3,4:8,8:16,16:32}"
 Z_MIN="${Z_MIN:-5.001}"
 Z_MAX="${Z_MAX:-24.97}"
+# Optional: concentrate rows on each cone's own reionization window, e.g.
+#   XHI_WINDOW=0.02,0.98 SLICES_PER_CONE=16 BACKGROUND_SLICES=2
+XHI_WINDOW="${XHI_WINDOW:-}"
+BACKGROUND_SLICES="${BACKGROUND_SLICES:-0}"
+# skip | clip: 178 cones exceed float16 T_b (|T_b| > 6e4 mK) in sampled slices;
+# "clip" keeps them (for x_HI work) and lists them in the tb_clipped attribute.
+TB_OVERFLOW="${TB_OVERFLOW:-skip}"
 N_SHARDS="${SLURM_ARRAY_TASK_COUNT:?submit as an array job}"
 SHARD="${SLURM_ARRAY_TASK_ID:?submit as an array job}"
 
@@ -41,5 +48,6 @@ OUT="$SHARD_DIR/shard$(printf %03d "$SHARD").h5"
 echo "shard $SHARD/$N_SHARDS  $LIGHTCONES/$PATTERN -> $OUT  ($(date))"
 python -m ebm21cm.data.cache build --data "$LIGHTCONES" --pattern "$PATTERN" --out "$OUT" \
     --slices-per-cone "$SLICES_PER_CONE" --bands="$BANDS" --z-min "$Z_MIN" --z-max "$Z_MAX" \
-    --shard "$SHARD" --n-shards "$N_SHARDS"
+    --shard "$SHARD" --n-shards "$N_SHARDS" --tb-overflow "$TB_OVERFLOW" \
+    ${XHI_WINDOW:+--xhi-window "$XHI_WINDOW" --background-slices "$BACKGROUND_SLICES"}
 echo "done $(date)"

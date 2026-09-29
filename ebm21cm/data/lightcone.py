@@ -46,12 +46,22 @@ def _scalar(v):
 class Lightcone:
     """Lazy reader. Use as a context manager."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, chunk_cache_bytes: int | None = None):
+        """``chunk_cache_bytes`` enlarges HDF5's per-dataset chunk cache (default 1 MB).
+
+        The cluster files store (9, 9, 293) gzip chunks, so one transverse slice
+        touches a full 140x140x293 slab. A cache holding a few slabs lets
+        neighbouring LOS reads reuse it instead of decompressing it again.
+        """
         self.path = Path(path)
+        self.chunk_cache_bytes = chunk_cache_bytes
         self._f: h5py.File | None = None
 
     def __enter__(self):
-        self._f = h5py.File(self.path, "r")
+        kw = {}
+        if self.chunk_cache_bytes:
+            kw = {"rdcc_nbytes": int(self.chunk_cache_bytes), "rdcc_nslots": 1_000_003}
+        self._f = h5py.File(self.path, "r", **kw)
         self._detect()
         return self
 
@@ -139,6 +149,27 @@ class Lightcone:
                     raise
                 out.append(np.nan)
         return np.asarray(out, dtype=np.float64)
+
+    # ------------------------------------------------------------ history
+    def xhi_history(self, block: int = 256) -> np.ndarray:
+        """Mean x_HI at every LOS index (increasing z), shape (n_los,).
+
+        Uses the stored global history (``global_quantities/neutral_fraction``
+        at ``node_redshifts``, raw_v2 only) interpolated to the lightcone
+        redshifts; otherwise averages the neutral-fraction field slice by slice.
+        The global history is a coeval-box mean, so it tracks the slice mean
+        only up to cosmic variance across the transverse plane.
+        """
+        f = self._f
+        if self.schema == "raw_v2" and "lightcone/global_quantities/neutral_fraction" in f \
+                and "lightcone/node_redshifts" in f:
+            zn = np.asarray(f["lightcone/node_redshifts"], dtype=np.float64)
+            xn = np.asarray(f["lightcone/global_quantities/neutral_fraction"], dtype=np.float64)
+            if zn.shape == xn.shape and zn.size > 1 and np.all(np.isfinite(xn)):
+                order = np.argsort(zn)
+                return np.interp(self.redshifts, zn[order], xn[order])
+        return np.concatenate([self.read_range("neutral_fraction", a, min(a + block, self.n_los)).mean(axis=(1, 2))
+                               for a in range(0, self.n_los, block)])
 
     # ------------------------------------------------------------ fields
     def read_range(self, field: str, lo: int, hi: int) -> np.ndarray:

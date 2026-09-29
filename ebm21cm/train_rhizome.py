@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, default_collate
 
 from .data.cache import SliceDataset, read_stats
+from .data.memory import MemorySplit, MemoryStream, parse_channels
 from .model.rhizome import RhizomeOperator2d
 from .run import git_commit
 from .train_recurrent import (
@@ -48,6 +49,19 @@ class LongRunConfig:
     train_probe_rows: int = 256
     seed: int = 0
     threads: int = 2
+    # "stream": per-row HDF5 reads (SliceDataset). "memory": splits held in
+    # memory and batched/augmented on the device (data.memory); required for
+    # band subsets and fast GPU training on full-size slices.
+    data: str = "stream"
+    channels: str = "all"
+    # Train on a fixed random subset of this many training cones (0 = all).
+    # The subset depends only on the cache, not on the seed.
+    train_cones: int = 0
+    eval_batch_size: int = 0
+    # With data="memory": where the splits live. "device" keeps them on the
+    # training device; "cpu" keeps them in host RAM and copies each batch,
+    # leaving the GPU to activations when the full training split is large.
+    storage: str = "device"
 
     def validate(self):
         ExperimentConfig(steps=self.max_steps, batch_size=self.batch_size, width=self.width,
@@ -64,6 +78,16 @@ class LongRunConfig:
             raise ValueError("require 0 < min_lr <= lr and 0 < lr_factor < 1")
         if not 0 <= self.relative_min_delta < 1:
             raise ValueError("relative_min_delta must be in [0, 1)")
+        if self.data not in ("stream", "memory"):
+            raise ValueError("data must be 'stream' or 'memory'")
+        if self.data == "stream" and (self.channels != "all" or self.train_cones):
+            raise ValueError("channels and train_cones require data='memory'")
+        if self.storage not in ("device", "cpu"):
+            raise ValueError("storage must be 'device' or 'cpu'")
+        for name in ("train_cones", "eval_batch_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
 
 
 @dataclass
@@ -135,6 +159,35 @@ class TrainingStream:
             self.dataset._rng.bit_generator.state = state["augmentation"]
         else:
             self.dataset._rng = None
+
+
+@torch.no_grad()
+def validation_scores(model, loader, device):
+    """Pixel-mean BCE and x_HI RMSE, plus the mean per-slice RMSE over mixed-phase
+    slices (0.05 < mean x_HI < 0.95), which is fno-21cm's val_l2 on such slices."""
+    model.eval()
+    bce, squared, pixels, slice_rmse, mixed_slices = 0.0, 0.0, 0, 0.0, 0
+    for batch in loader:
+        cond, scalars, truth = _batch(batch, device)
+        logits = model(cond, scalars)
+        bce += float(F.binary_cross_entropy_with_logits(logits, truth, reduction="sum"))
+        error = (logits.sigmoid() - truth).square()
+        squared += float(error.sum())
+        pixels += truth.numel()
+        means = truth.mean((1, 2, 3))
+        mixed = (means > 0.05) & (means < 0.95)
+        slice_rmse += float(error[mixed].mean((1, 2, 3)).sqrt().sum())
+        mixed_slices += int(mixed.sum())
+    return {"bce": bce / pixels, "rmse": math.sqrt(squared / pixels),
+            "mixed_slice_rmse": slice_rmse / mixed_slices if mixed_slices else None}
+
+
+def train_cone_subset(cones, limit):
+    """A fixed random subset of ``limit`` training cones, or None for all of them."""
+    cones = np.array(sorted(cones))
+    if not limit or limit >= len(cones):
+        return None
+    return np.sort(np.random.default_rng(0).permutation(cones)[:limit])
 
 
 def _sha256(path):
@@ -209,21 +262,43 @@ def run(cache_path, run_dir, config=None, device="cpu", resume=False):
     cache_hash = _sha256(cache_path)
     root = Path(__file__).resolve().parent.parent
     source_paths = ("ebm21cm/train_rhizome.py", "ebm21cm/train_recurrent.py", "ebm21cm/model/rhizome.py",
-                    "ebm21cm/model/recurrent.py", "ebm21cm/data/cache.py", "ebm21cm/data/toy.py")
+                    "ebm21cm/model/recurrent.py", "ebm21cm/data/cache.py", "ebm21cm/data/toy.py",
+                    "ebm21cm/data/memory.py")
     hashes = {p: _sha256(root / p) for p in source_paths}
+    eval_batch = config.eval_batch_size or config.batch_size
+    channels = parse_channels(config.channels, json.loads(datasets["train"].attrs["bands"]))
+    subset = train_cone_subset(cones["train"], config.train_cones)
+    if config.data == "memory":
+        load_start = time.perf_counter()
+        storage = device if config.storage == "device" else torch.device("cpu")
+        memory = {s: MemorySplit(cache_path, s, stats, channels, cones=subset if s == "train" else None,
+                                 storage=storage, device=device) for s in ("train", "validation")}
+        print(f"Loaded train/validation into {storage} memory: "
+              f"{sum(m.nbytes for m in memory.values()) / 2**30:.1f} GiB, "
+              f"{len(memory['train'])}/{len(memory['validation'])} rows, "
+              f"{time.perf_counter() - load_start:.0f} s", flush=True)
+        augmented = memory["train"]
+        stream = MemoryStream(augmented, config.batch_size, config.seed)
+        val_loader = memory["validation"].loader(eval_batch)
+        train_rows = augmented.rows
+    else:
+        augmented = SliceDataset(cache_path, "train", stats, augment_data=True, seed=config.seed)
+        stream = TrainingStream(augmented, config.batch_size, config.seed)
+        val_loader = DataLoader(datasets["validation"], batch_size=eval_batch)
+        train_rows = datasets["train"].rows
     model_config = {
-        "in_channels": datasets["train"].n_cond, "out_channels": 1,
+        "in_channels": len(channels), "out_channels": 1,
         "scalar_dim": datasets["train"].n_scalars, "width": config.width, "modes": config.modes,
         "n_steps": config.updates, "step_size": config.step_size,
     }
     model = RhizomeOperator2d(**model_config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    augmented = SliceDataset(cache_path, "train", stats, augment_data=True, seed=config.seed)
-    stream = TrainingStream(augmented, config.batch_size, config.seed)
-    val_loader = DataLoader(datasets["validation"], batch_size=config.batch_size)
     probe_indices = np.random.default_rng(config.seed).choice(
-        len(datasets["train"]), min(config.train_probe_rows, len(datasets["train"])), replace=False)
-    probe_loader = DataLoader(Subset(datasets["train"], probe_indices.tolist()), batch_size=config.batch_size)
+        len(train_rows), min(config.train_probe_rows, len(train_rows)), replace=False)
+    if config.data == "memory":
+        probe_loader = augmented.loader(eval_batch, np.sort(probe_indices))
+    else:
+        probe_loader = DataLoader(Subset(datasets["train"], probe_indices.tolist()), batch_size=eval_batch)
     signature = {"config": {k: v for k, v in asdict(config).items() if k != "max_steps"},
                  "cache_sha256": cache_hash, "source_sha256": hashes,
                  "torch": str(torch.__version__), "device": str(device)}
@@ -256,19 +331,24 @@ def run(cache_path, run_dir, config=None, device="cpu", resume=False):
             raise ValueError("max_steps may only increase on resume")
         print(f"Resumed step {step}; best validation BCE {plateau.best:.6f}", flush=True)
     else:
-        initial = validation_bce(model, val_loader, device)
+        scores = validation_scores(model, val_loader, device)
+        initial = scores["bce"]
         if not math.isfinite(initial):
             raise FloatingPointError("non-finite initial validation loss")
         plateau = PlateauState(initial, initial)
         best_model = _cpu_state(model)
         history.append({"step": 0, "train_window_bce": None,
                         "train_probe_bce": validation_bce(model, probe_loader, device),
-                        "validation_bce": initial, "lr": config.lr, "next_lr": config.lr})
+                        "validation_bce": initial, "validation_rmse": scores["rmse"],
+                        "validation_mixed_slice_rmse": scores["mixed_slice_rmse"],
+                        "lr": config.lr, "next_lr": config.lr})
         metadata = {
             **signature, "model_config": model_config, "stats": stats,
             "cache": str(Path(cache_path).resolve()), "git_commit": git_commit(root),
             "splits": {s: {"rows": len(ds), "cones": sorted(cones[s])} for s, ds in datasets.items()},
-            "train_probe_cache_rows": datasets["train"].rows[probe_indices].tolist(),
+            "channels": channels, "bands": [json.loads(datasets["train"].attrs["bands"])[j] for j in channels],
+            "train_subset": None if subset is None else {"rows": len(train_rows), "cones": subset.tolist()},
+            "train_probe_cache_rows": train_rows[probe_indices].tolist(),
             "architecture": "rhizome", "initial_max_steps": config.max_steps,
             "stopping_rule": "Validation plateau at minimum LR; not mathematical convergence.",
         }
@@ -280,7 +360,7 @@ def run(cache_path, run_dir, config=None, device="cpu", resume=False):
         saved_elapsed = elapsed + time.perf_counter() - start
         _atomic_save({
             "signature": signature, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
-            "model_config": model_config, "architecture": "rhizome", "stats": stats,
+            "model_config": model_config, "architecture": "rhizome", "stats": stats, "channels": channels,
             "stream": stream.state_dict(), "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else [],
             "step": step, "samples_seen": samples_seen, "elapsed_seconds": saved_elapsed,
@@ -291,7 +371,8 @@ def run(cache_path, run_dir, config=None, device="cpu", resume=False):
         # Recreate best.pt from the authoritative last checkpoint on resume,
         # including recovery from interruption between these two file writes.
         _atomic_save({"model": best_model, "model_config": model_config, "architecture": "rhizome",
-                      "stats": stats, "step": plateau.best_step, "validation_bce": plateau.best},
+                      "stats": stats, "channels": channels, "step": plateau.best_step,
+                      "validation_bce": plateau.best},
                      run_dir / "best.pt")
         (run_dir / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in history))
         return saved_elapsed
@@ -316,7 +397,8 @@ def run(cache_path, run_dir, config=None, device="cpu", resume=False):
             # Budget stops between checks preserve the partial loss window and
             # do not add a scheduler event absent from uninterrupted training.
             if step % config.val_every == 0:
-                val = validation_bce(model, val_loader, device)
+                scores = validation_scores(model, val_loader, device)
+                val = scores["bce"]
                 lr = optimizer.param_groups[0]["lr"]
                 next_lr, stopped, improved = plateau.observe(val, step, lr, config)
                 if improved:
@@ -327,7 +409,9 @@ def run(cache_path, run_dir, config=None, device="cpu", resume=False):
                     "step": step, "epochs_seen": samples_seen / len(augmented),
                     "train_window_bce": window_loss / window_pixels,
                     "train_probe_bce": validation_bce(model, probe_loader, device),
-                    "validation_bce": val, "best_validation_bce": plateau.best,
+                    "validation_bce": val, "validation_rmse": scores["rmse"],
+                    "validation_mixed_slice_rmse": scores["mixed_slice_rmse"],
+                    "best_validation_bce": plateau.best,
                     "best_step": plateau.best_step, "lr": lr, "next_lr": next_lr,
                     "bad_checks": plateau.bad_checks, "lr_reductions": plateau.reductions,
                     "grad_norm": float(grad_norm),
@@ -337,6 +421,7 @@ def run(cache_path, run_dir, config=None, device="cpu", resume=False):
                 save()
                 print(f"step {step:6d} epochs {record['epochs_seen']:6.1f} "
                       f"train {record['train_window_bce']:.5f} val {val:.5f} "
+                      f"mixed-rmse {scores['mixed_slice_rmse'] or float('nan'):.5f} "
                       f"best {plateau.best:.5f} lr {lr:.2g}->{next_lr:.2g} "
                       f"plateau {plateau.bad_checks}/{config.stop_patience}", flush=True)
     except KeyboardInterrupt:
@@ -357,7 +442,11 @@ def run(cache_path, run_dir, config=None, device="cpu", resume=False):
     }
     if stopped:
         best, _ = load_checkpoint(run_dir / "best.pt", device)
-        test_loader = DataLoader(datasets["test"], batch_size=config.batch_size)
+        if config.data == "memory":
+            test_loader = MemorySplit(cache_path, "test", stats, channels, storage=storage,
+                                      device=device).loader(eval_batch)
+        else:
+            test_loader = DataLoader(datasets["test"], batch_size=eval_batch)
         fields, _ = predict(best, test_loader, device)
         result["test"] = field_metrics(fields["prediction"], fields["truth"])
         result["test_evaluated"] = True

@@ -108,6 +108,8 @@ def field_metrics(pred, truth):
         return {
             "n_slices": len(t),
             "rmse": float(np.sqrt(np.mean((p - t) ** 2))),
+            # Mean of per-slice RMSEs: fno-21cm's val_l2 (LpLoss.abs, d=2) on the same slices.
+            "slice_rmse_mean": float(np.mean(np.sqrt(np.mean((p - t) ** 2, axis=(1, 2))))),
             "pixel_accuracy": float(np.mean(pi == ti)),
             "ionized_iou": float(np.logical_and(pi, ti).sum() / union) if union else None,
             "slice_mean_mae": float(np.mean(np.abs(p.mean((1, 2)) - t.mean((1, 2))))),
