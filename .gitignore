@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.DS_Store
+
+# Data, caches and run outputs never belong in the repository.
+*.h5
+*.hdf5
+*.pt
+*.npz
+runs/
+data/
+logs/
+outputs/

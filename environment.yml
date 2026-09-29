@@ -1,0 +1,14 @@
+name: ebm-env
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pytorch
+  - numpy
+  - scipy
+  - h5py
+  - matplotlib
+  - pytest
+  - pip

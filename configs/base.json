@@ -1,0 +1,9 @@
+{
+  "model": {"ch": 64, "mults": [1, 2, 4], "num_res": 2, "attn_levels": [2], "heads": 4, "dropout": 0.0},
+  "train": {
+    "batch_size": 16, "lr": 2e-4, "warmup": 1000, "steps": 300000, "ema_decay": 0.9995,
+    "grad_clip": 1.0, "p_mean": -0.4, "p_std": 1.4, "sample_sigma_max": 10.0, "augment": true, "amp": "none",
+    "workers": 8, "log_every": 100, "val_every": 2000, "val_rows": 64,
+    "ckpt_every": 5000, "sample_every": 10000, "sample_rows": 8, "sample_steps": 32
+  }
+}

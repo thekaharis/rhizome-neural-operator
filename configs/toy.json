@@ -1,0 +1,8 @@
+{
+  "model": {"ch": 32, "mults": [1, 2, 4], "num_res": 2, "attn_levels": [2], "heads": 4},
+  "train": {
+    "batch_size": 16, "lr": 3e-4, "warmup": 200, "steps": 6000, "ema_decay": 0.999,
+    "workers": 2, "log_every": 100, "val_every": 500, "val_rows": 64,
+    "ckpt_every": 1000, "sample_every": 2000, "sample_rows": 6, "sample_steps": 24
+  }
+}
