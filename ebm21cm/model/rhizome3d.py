@@ -21,6 +21,16 @@ synchronous update, and all other maps pointwise. Differences from 2-D:
   ~4 m_x m_y m_z C^2 real parameters, hundreds of millions in 3-D. With
   ``rank=r`` the kernel is K(k) = P_out diag(w(k)) P_in: shared complex channel
   projections C->r->C and r complex weights per mode.
+* **Compact kernel (optional).** ``radius=R`` replaces the Fourier kernel by
+  a real-space one, kappa(d) = 0 for |d| > R cells (Euclidean ball of integer
+  offsets): R=1 is the 6 face neighbours plus self, sqrt(2) adds edges,
+  sqrt(3) the full 3x3x3 cube. Transverse padding is circular, LOS padding is
+  zero, so the LOS convolution is exactly linear and ``los_pad`` is unused.
+  Locality compounds: after T updates a site sees at most T*R cells away, so
+  core predictions are independent of the window edges when T*R <= halo.
+  ``rank`` factorizes it as K(d) = P_out diag(w(d)) P_in, as for the spectral
+  kernel. Offsets are in cells, so R has no fixed physical scale across
+  resolutions.
 * **Memory.** ``checkpoint=True`` recomputes each update in the backward pass,
   so only the T+1 states of a rollout are stored.
 
@@ -144,15 +154,67 @@ class StructuredBrightness3d(nn.Module):
         return ((tb - st["tb_offset"]) / st["tb_scale"])[:, None]
 
 
+def ball_offsets(radius):
+    """Integer offsets d with |d| <= radius, as an (n, 3) tensor (self included)."""
+    if isinstance(radius, bool) or not radius >= 1:
+        raise ValueError("radius must be >= 1 cell")
+    r = int(radius + 1e-9)
+    axis = torch.arange(-r, r + 1)
+    grid = torch.cartesian_prod(axis, axis, axis)
+    return grid[grid.square().sum(1) <= radius ** 2 + 1e-9]
+
+
+class LocalConv3d(nn.Module):
+    """Channel-mixing kernel supported on a ball: kappa(d) = 0 for |d| > radius cells."""
+
+    def __init__(self, channels, radius, rank=None):
+        super().__init__()
+        self.channels = _integer("channels", channels)
+        self.radius = float(radius)
+        self.rank = None if rank is None else _integer("rank", rank)
+        offsets = ball_offsets(radius)
+        self.reach = int(offsets.max())
+        self.register_buffer("offsets", offsets + self.reach, persistent=False)
+        n = len(offsets)
+        if self.rank is None:
+            self.weight = nn.Parameter(torch.randn(channels, channels, n) / (channels * n) ** 0.5)
+        else:
+            r = self.rank
+            self.proj_in = nn.Parameter(torch.randn(r, channels, 1, 1, 1) / channels ** 0.5)
+            self.proj_out = nn.Parameter(torch.randn(channels, r, 1, 1, 1) / r ** 0.5)
+            self.weight = nn.Parameter(torch.randn(r, 1, n) / n ** 0.5)
+
+    def forward(self, x):
+        if x.ndim != 5 or x.shape[1] != self.channels:
+            raise ValueError(f"expected (B,{self.channels},X,Y,Z) input")
+        p = self.reach
+        if min(x.shape[-3:-1]) < 2 * p + 1:
+            raise ValueError(f"transverse grid {tuple(x.shape[-3:-1])} too small for radius {self.radius}")
+        size = 2 * p + 1
+        kernel = self.weight.new_zeros(*self.weight.shape[:2], size, size, size)
+        ix, iy, iz = self.offsets.unbind(1)
+        kernel[:, :, ix, iy, iz] = self.weight
+        # Periodic box faces transversally, empty space beyond the LOS window.
+        x = F.pad(F.pad(x, (0, 0, p, p, p, p), mode="circular"), (p, p))
+        if self.rank is None:
+            return F.conv3d(x, kernel.to(x.dtype))
+        x = F.conv3d(x, self.proj_in.to(x.dtype))
+        x = F.conv3d(x, kernel.to(x.dtype), groups=self.rank)
+        return F.conv3d(x, self.proj_out.to(x.dtype))
+
+
 class IntegralUpdate3d(nn.Module):
     """Gated state-dependent integral interaction, then a pointwise convex update."""
 
-    def __init__(self, width, modes, step_size, los_pad, rank):
+    def __init__(self, width, modes, step_size, los_pad, rank, radius=None):
         super().__init__()
         self.step_size = step_size
         self.gates = nn.Conv3d(2 * width, 2 * width, 1)
         self.value = nn.Conv3d(2 * width, width, 1, bias=False)
-        self.kernel = SpectralConv3d(width, modes, los_pad, rank)
+        if radius is None:
+            self.kernel = SpectralConv3d(width, modes, los_pad, rank)
+        else:
+            self.kernel = LocalConv3d(width, radius, rank)
         self.proposal = nn.Conv3d(3 * width, width, 1)
 
     def forward(self, state, forcing):
@@ -168,7 +230,7 @@ class RhizomeOperator3d(nn.Module):
 
     def __init__(self, in_channels, width=48, modes=(24, 24, 16), n_steps=6, step_size=0.5,
                  los_pad=64, rank=None, untied=False, checkpoint=True, amp=True,
-                 targets=("neutral_fraction",), tb_head=None, structured=None):
+                 targets=("neutral_fraction",), tb_head=None, structured=None, radius=None):
         super().__init__()
         self.in_channels = _integer("in_channels", in_channels)
         self.width = _integer("width", width)
@@ -178,9 +240,9 @@ class RhizomeOperator3d(nn.Module):
         self.untied, self.checkpoint, self.amp = bool(untied), bool(checkpoint), bool(amp)
         self.config = {"in_channels": in_channels, "width": width, "modes": list(modes), "n_steps": n_steps,
                        "step_size": step_size, "los_pad": los_pad, "rank": rank, "untied": untied,
-                       "checkpoint": checkpoint, "amp": amp}
+                       "checkpoint": checkpoint, "amp": amp, "radius": radius}
         self.lift = nn.Conv3d(in_channels, width, 1)
-        self.cells = nn.ModuleList([IntegralUpdate3d(width, tuple(modes), float(step_size), los_pad, rank)
+        self.cells = nn.ModuleList([IntegralUpdate3d(width, tuple(modes), float(step_size), los_pad, rank, radius)
                                     for _ in range(n_steps if untied else 1)])
         self.targets = tuple(targets)
         if self.targets[0] != "neutral_fraction" or not set(self.targets) <= {"neutral_fraction", "brightness_temp"}:

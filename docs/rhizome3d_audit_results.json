@@ -1,0 +1,248 @@
+{
+  "torch": "2.9.1",
+  "device": "cpu",
+  "source_sha256": {
+    "ebm21cm/model/rhizome3d.py": "6df890301649869da900da5fecececefb70e553287bacccb88e7f510c9f81a0e",
+    "ebm21cm/train_rhizome3d.py": "9be6d8b6e1ce9afd2755805f332dc13b2cff6ab2add8b696da1b97078c051be8",
+    "tests/test_rhizome3d.py": "c4316bed24c2c697b740e3d8b594008fd8e4251bfcfa48a09d4e47a48273d693"
+  },
+  "dense_reference": [
+    {
+      "shape": [
+        4,
+        6,
+        5
+      ],
+      "pad": 0,
+      "rank": null,
+      "max_output_error": 1.1102230246251565e-15,
+      "max_gradient_error": 4.996003610813204e-16
+    },
+    {
+      "shape": [
+        4,
+        6,
+        5
+      ],
+      "pad": 0,
+      "rank": 2,
+      "max_output_error": 2.220446049250313e-16,
+      "max_gradient_error": 2.220446049250313e-16
+    },
+    {
+      "shape": [
+        4,
+        6,
+        5
+      ],
+      "pad": 4,
+      "rank": null,
+      "max_output_error": 4.996003610813204e-16,
+      "max_gradient_error": 2.0816681711721685e-16
+    },
+    {
+      "shape": [
+        4,
+        6,
+        5
+      ],
+      "pad": 4,
+      "rank": 2,
+      "max_output_error": 2.220446049250313e-16,
+      "max_gradient_error": 1.1102230246251565e-16
+    },
+    {
+      "shape": [
+        4,
+        6,
+        5
+      ],
+      "pad": 5,
+      "rank": null,
+      "max_output_error": 4.440892098500626e-16,
+      "max_gradient_error": 1.942890293094024e-16
+    },
+    {
+      "shape": [
+        4,
+        6,
+        5
+      ],
+      "pad": 5,
+      "rank": 2,
+      "max_output_error": 1.249000902703301e-16,
+      "max_gradient_error": 8.326672684688674e-17
+    },
+    {
+      "shape": [
+        5,
+        7,
+        5
+      ],
+      "pad": 0,
+      "rank": null,
+      "max_output_error": 6.106226635438361e-16,
+      "max_gradient_error": 3.677613769070831e-16
+    },
+    {
+      "shape": [
+        5,
+        7,
+        5
+      ],
+      "pad": 0,
+      "rank": 2,
+      "max_output_error": 3.608224830031759e-16,
+      "max_gradient_error": 1.6653345369377348e-16
+    },
+    {
+      "shape": [
+        5,
+        7,
+        5
+      ],
+      "pad": 4,
+      "rank": null,
+      "max_output_error": 4.0245584642661925e-16,
+      "max_gradient_error": 2.7755575615628914e-16
+    },
+    {
+      "shape": [
+        5,
+        7,
+        5
+      ],
+      "pad": 4,
+      "rank": 2,
+      "max_output_error": 2.498001805406602e-16,
+      "max_gradient_error": 9.71445146547012e-17
+    },
+    {
+      "shape": [
+        5,
+        7,
+        5
+      ],
+      "pad": 5,
+      "rank": null,
+      "max_output_error": 4.163336342344337e-16,
+      "max_gradient_error": 1.942890293094024e-16
+    },
+    {
+      "shape": [
+        5,
+        7,
+        5
+      ],
+      "pad": 5,
+      "rank": 2,
+      "max_output_error": 1.6653345369377348e-16,
+      "max_gradient_error": 6.938893903907228e-17
+    }
+  ],
+  "valid_anisotropic_grid": {
+    "accepted": false,
+    "error": "grid (6, 10, 8) too small for modes (3, 4, 2)"
+  },
+  "dc_normalization": [
+    {
+      "Z": 8,
+      "pad": 0,
+      "actual": 0.9999999999999999,
+      "padded_measure_prediction": 1.0
+    },
+    {
+      "Z": 8,
+      "pad": 4,
+      "actual": 0.6666666666666666,
+      "padded_measure_prediction": 0.6666666666666666
+    },
+    {
+      "Z": 16,
+      "pad": 4,
+      "actual": 0.8000000000000002,
+      "padded_measure_prediction": 0.8
+    },
+    {
+      "Z": 16,
+      "pad": 8,
+      "actual": 0.6666666666666666,
+      "padded_measure_prediction": 0.6666666666666666
+    }
+  ],
+  "hermitian_null_directions": {
+    "parameter_dtype": "torch.complex128",
+    "imaginary_dc_output_change": 0.0,
+    "anti_hermitian_pair_output_change": 5.551115123125783e-17
+  },
+  "factorized_effective_dc_rank": {
+    "configured_rank": 1,
+    "complex_matrix_rank": 1,
+    "real_dc_matrix_rank": 2
+  },
+  "default_los_collision": {
+    "Z": 256,
+    "pad": 64,
+    "halo": 32,
+    "padded_length": 320,
+    "receiver_source_pairs": [
+      [
+        160,
+        0
+      ],
+      [
+        95,
+        255
+      ]
+    ],
+    "signed_offsets": [
+      160,
+      -160
+    ],
+    "modular_offsets": [
+      160,
+      160
+    ],
+    "positive_offset_response": -0.0062499999999999995,
+    "negative_offset_response": -0.006249999999999999,
+    "max_response_difference": 8.673617379884035e-19,
+    "full_domain_minimum_pad": 255,
+    "single_update_core_receiver_minimum_pad": 191
+  },
+  "existing_boundary_test_sensitivity": [
+    {
+      "pad": 0,
+      "existing_shift_assertion_passes": true
+    },
+    {
+      "pad": 4,
+      "existing_shift_assertion_passes": true
+    },
+    {
+      "pad": 9,
+      "existing_shift_assertion_passes": true
+    }
+  ],
+  "double_model_output_dtype": "torch.float32",
+  "default_kernel_real_parameters": {
+    "dense": 162865152,
+    "rank48": 3402240
+  },
+  "external_api_static_inspection": {
+    "root": "/Users/kaharis/Library/CloudStorage/GoogleDrive-hariskapetanovic24@gmail.com/Meine Ablage/Dokumente/Studium/Thesis/Code/FNO v3",
+    "constructor_parameters": [
+      "self",
+      "source",
+      "rows",
+      "config",
+      "seed"
+    ],
+    "constructor_accepts_augment": false,
+    "validation_subset_bound_by_definition_or_import": false,
+    "source_sha256": {
+      "dataset/los_windows.py": "18522fc98e2e42e28ccbe5d8490fbe328e7b038c0a2fe26930d464b7c7e5554b",
+      "fno_multifield.py": "3ababb518c7a96861b38129e0b925086baafac22d7940ee99e0d5654418be4cc"
+    },
+    "scope": "AST signatures only; remote checkout and end-to-end execution not checked"
+  }
+}

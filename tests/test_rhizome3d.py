@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from ebm21cm.model.rhizome3d import RhizomeOperator3d, SpectralConv3d
+from ebm21cm.model.rhizome3d import LocalConv3d, RhizomeOperator3d, SpectralConv3d, ball_offsets
 
 
 def small(**kw):
@@ -143,3 +143,50 @@ def test_multifield_config_validation():
     with pytest.raises(ValueError):
         RhizomeOperator3d(4, width=6, modes=(3, 3, 2), targets=("neutral_fraction", "brightness_temp"),
                           tb_head="structured")
+
+
+@pytest.mark.parametrize("radius,count", [(1, 7), (2 ** 0.5, 19), (3 ** 0.5, 27), (2, 33), (3, 123)])
+def test_ball_offsets_count_lattice_points(radius, count):
+    assert len(ball_offsets(radius)) == count
+
+
+def test_local_kernel_single_offset_is_periodic_transverse_zero_filled_los_shift():
+    conv = LocalConv3d(1, 2.5).double()
+    with torch.no_grad():
+        conv.weight.zero_()
+        conv.weight[0, 0, ball_offsets(2.5).tolist().index([1, -1, 2])] = 1
+    x = torch.randn(1, 1, 6, 6, 9, dtype=torch.float64)
+    # Cross-correlation: y(r) = x(r + d).
+    expected = torch.zeros_like(x)
+    expected[..., :-2] = torch.roll(x, (-1, 1), dims=(2, 3))[..., 2:]
+    assert torch.allclose(conv(x), expected)
+
+
+@pytest.mark.parametrize("rank", [None, 3])
+def test_local_model_influence_stays_inside_steps_times_radius(rank):
+    torch.manual_seed(0)
+    model = RhizomeOperator3d(4, width=6, n_steps=2, radius=1.5, rank=rank, amp=False).double().eval()
+    x = torch.randn(1, 4, 12, 12, 14, dtype=torch.float64)
+    bumped = x.clone()
+    bumped[0, :, 0, 5, 7] += 1.0
+    changed = (model(bumped) - model(x)).abs()[0, 0] > 0
+    i, j, k = torch.meshgrid(*(torch.arange(n) for n in (12, 12, 14)), indexing="ij")
+    di, dj = torch.minimum(i, 12 - i), torch.minimum((j - 5).abs(), 12 - (j - 5).abs())
+    dist = (di.square() + dj.square() + (k - 7).square()).double().sqrt()
+    assert changed[dist <= 1.5].all() and not changed[dist > 2 * 1.5 + 1e-9].any()
+    assert changed[dist > 1.5].any()  # the second update does extend the reach
+    model(x, logits=True).square().mean().backward()
+    assert all(q.grad is not None and torch.isfinite(q.grad).all() for q in model.parameters())
+
+
+def test_local_model_commutes_with_transverse_rolls():
+    torch.manual_seed(0)
+    model = RhizomeOperator3d(4, width=6, n_steps=2, radius=2, amp=False).double().eval()
+    x = torch.randn(1, 4, 8, 8, 10, dtype=torch.float64)
+    assert torch.allclose(model(torch.roll(x, (3, 5), dims=(2, 3))), torch.roll(model(x), (3, 5), dims=(2, 3)))
+
+
+def test_local_kernel_is_far_smaller_than_spectral():
+    count = lambda m: sum(q.numel() * (2 if q.is_complex() else 1) for q in m.parameters())
+    assert count(LocalConv3d(48, 2)) == 48 * 48 * 33
+    assert count(LocalConv3d(48, 2)) < count(SpectralConv3d(48, (6, 6, 4))) / 20

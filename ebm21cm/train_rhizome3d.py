@@ -138,6 +138,8 @@ def main(argv=None):
     p.add_argument("--step-size", type=float, default=0.5)
     p.add_argument("--los-pad", type=int, default=64)
     p.add_argument("--rank", type=int, default=0, help="factorized kernel rank; 0 = dense per-mode matrices")
+    p.add_argument("--radius", type=float, default=0.0,
+                   help="compact real-space kernel of this radius in cells (--modes/--los-pad unused); 0 = spectral")
     p.add_argument("--no-checkpoint", action="store_true")
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--window-size", type=int, default=256)
@@ -196,6 +198,8 @@ def main(argv=None):
     model_config = {"in_channels": dataset.in_channels, "width": args.width, "modes": list(args.modes),
                     "n_steps": args.updates, "step_size": args.step_size, "los_pad": args.los_pad,
                     "rank": args.rank or None, "checkpoint": not args.no_checkpoint, "amp": not args.no_amp}
+    if args.radius:  # spectral configs stay exactly as before
+        model_config["radius"] = args.radius
     if multifield:  # x_HI-only configs stay exactly as before
         from dataset.lightcone_params import PARAM_NAMES
 
@@ -220,6 +224,8 @@ def main(argv=None):
     for key, default in MULTIFIELD_DEFAULTS.items():
         if signature.get(key) == default:
             signature.pop(key)
+    if not args.radius:
+        del signature["radius"]  # spectral runs started before --radius existed must still resume
     state = {"epoch": 0, "position": 0, "step": 0, "best_val_rmse": float("inf"), "best_epoch": None,
              "elapsed": 0.0, "history": []}
     last = run_dir / "last.pt"
