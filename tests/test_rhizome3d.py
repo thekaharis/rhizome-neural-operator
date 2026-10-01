@@ -64,3 +64,14 @@ def test_checkpointing_matches_plain_gradients():
 def test_rejects_too_many_modes():
     with pytest.raises(ValueError):
         SpectralConv3d(2, (5, 3, 2))(torch.zeros(1, 2, 8, 8, 10))
+
+
+def test_warm_start_signature_is_backward_compatible():
+    import ebm21cm.train_rhizome3d as tr
+    parser_args = ["--run-dir", "x"]
+    # The parser exposes the warm-start options...
+    import argparse, inspect
+    source = inspect.getsource(tr.main)
+    assert '"--init-from"' in source and '"--init-optimizer"' in source
+    # ...and drops them from the resume signature when unused.
+    assert 'signature.pop("init_from", None)' in source

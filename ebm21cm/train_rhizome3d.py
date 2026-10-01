@@ -111,6 +111,10 @@ def main(argv=None):
     p.add_argument("--max-steps", type=int, default=0, help="stop cleanly (resumable) at this step; 0 = none")
     p.add_argument("--skip-final-eval", action="store_true")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--init-from", default=None,
+                   help="warm start a NEW run from another run's last.pt/best.pt weights (same model config)")
+    p.add_argument("--init-optimizer", action="store_true",
+                   help="with --init-from and a last.pt: also load its Adam state")
     args = p.parse_args(argv)
 
     fm, FieldMapping, FieldRegistry, LOSWindowConfig, LOSWindowDataset = fno_pipeline(args.fno_root)
@@ -140,6 +144,11 @@ def main(argv=None):
     run_dir.mkdir(parents=True, exist_ok=True)
     signature = {k: v for k, v in vars(args).items()
                  if k not in ("max_hours", "max_steps", "save_minutes", "skip_final_eval", "workers")}
+    # Unused warm-start options stay out of the signature, so runs started before
+    # they existed still resume.
+    if not args.init_from:
+        signature.pop("init_from", None)
+        signature.pop("init_optimizer", None)
     state = {"epoch": 0, "position": 0, "step": 0, "best_val_rmse": float("inf"), "best_epoch": None,
              "elapsed": 0.0, "history": []}
     last = run_dir / "last.pt"
@@ -157,6 +166,21 @@ def main(argv=None):
     else:
         if any(run_dir.iterdir()):
             raise ValueError(f"{run_dir} is not empty and has no last.pt")
+        warm = None
+        if args.init_from:
+            warm = torch.load(args.init_from, map_location="cpu", weights_only=False)
+            if warm["model_config"] != model_config:
+                raise ValueError("--init-from model config differs from the requested model")
+            model.load_state_dict(warm["model"])
+            if args.init_optimizer:
+                if "optimizer" not in warm:
+                    raise ValueError("--init-optimizer needs a last.pt (best.pt holds no optimizer state)")
+                optimizer.load_state_dict(warm["optimizer"])
+            # The new schedule (warmup + cosine from --lr) replaces the loaded learning rate.
+            for group in optimizer.param_groups:
+                group["lr"] = args.lr
+            print(f"Warm start from {args.init_from}"
+                  f"{' (with optimizer state)' if args.init_optimizer else ''}", flush=True)
         root = Path(__file__).resolve().parent.parent
         metadata = {
             "signature": signature, "model_config": model_config,
@@ -167,6 +191,10 @@ def main(argv=None):
             "objective": "BCE on window core (halo excluded), x_HI only",
             "git_commit": git_commit(root), "fno_git_commit": git_commit(Path(args.fno_root)),
             "torch": str(torch.__version__), "device": torch.cuda.get_device_name() if cuda else "cpu",
+            "init_from": None if warm is None else {
+                "path": str(Path(args.init_from).resolve()), "optimizer": args.init_optimizer,
+                "source_state": {k: warm["state"][k] for k in ("epoch", "step", "best_val_rmse", "best_epoch")}
+                if "state" in warm else {"epoch": warm.get("epoch")}},
         }
         (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
     val_rows, val_info = fm.validation_subset(dataset, rows["val"], args.val_cones, "neutral_fraction")
