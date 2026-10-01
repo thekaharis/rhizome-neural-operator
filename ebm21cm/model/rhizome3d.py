@@ -25,9 +25,16 @@ synchronous update, and all other maps pointwise. Differences from 2-D:
   so only the T+1 states of a rollout are stored.
 
 Inputs follow fno-21cm's LOS-window interface: ``x`` is (B, C_in, X, Y, Z) with
-the density, 1/(1+z), parameters, position and validity channels already
-broadcast; the model lifts them pointwise. ``forward`` returns x_HI in [0, 1];
-``logits=True`` returns pre-sigmoid values for BCE training.
+the input fields, 1/(1+z), parameters, position, validity and optional
+emulated-history channels already broadcast; the model lifts them pointwise.
+``forward`` returns x_HI in [0, 1]; ``logits=True`` returns its pre-sigmoid
+value for BCE training.
+
+**Multi-field.** With ``targets=("neutral_fraction", "brightness_temp")`` both
+fields are decoded from the same per-cell state: channel 0 is x_HI, channel 1
+the *normalized* T_b. ``tb_head="plain"`` regresses it directly;
+``"structured"`` builds it from physics (``StructuredBrightness3d``) and only
+learns the spin term, using the model's own x_HI.
 """
 
 from __future__ import annotations
@@ -94,6 +101,49 @@ class SpectralConv3d(nn.Module):
         return y[..., :nz]
 
 
+class StructuredBrightness3d(nn.Module):
+    """T_b from its physical structure; only the spin factor is learned.
+
+        T_b = A(z) * x_HI * (1 + delta) * S * V
+        A(z) = 27 mK (Ob h^2/0.023) sqrt(0.15/(Om h^2) (1+z)/10)
+        S    = 1 - T_CMB/T_S = 1 - exp(u)       (u from the network; S <= 1)
+        V    = 1/(1 + clip((dv/dr)/H, +-0.2))   (optically thin velocity factor)
+
+    A port of fno-21cm's ``multifield_model.StructuredBrightness`` with the same
+    constants, dv/dr clip and normalization, so the two heads are comparable.
+    ``indices`` locate density, LOS velocity, 1/(1+z), OMm and the relative LOS
+    position in the input channels; ``stats`` de-normalize them and normalize
+    the resulting T_b to the target statistics.
+    """
+    HUBBLE_H = 0.6766
+    OMEGA_B_H2 = 0.02242
+    MAX_DVDR = 0.2
+    U_MAX = 5.0
+
+    def __init__(self, indices, stats):
+        super().__init__()
+        self.indices = {k: int(v) for k, v in indices.items()}
+        self.stats = {k: float(v) for k, v in stats.items()}
+
+    def forward(self, x, xhi, u):
+        i, st = self.indices, self.stats
+        f = x.float()
+        delta = f[:, i["density"]] * st["density_scale"] + st["density_offset"]
+        velocity = f[:, i["velocity"]].double() * st["velocity_scale"] + st["velocity_offset"]
+        z = 1.0 / f[:, i["z"]] - 1.0
+        omm = f[:, i["omm"]] * st["omm_std"] + st["omm_mean"]
+        rel = f[0, i["relative"], 0, 0, :2]
+        cell = float(rel[1] - rel[0]) * 1000.0
+        h0 = 100.0 * self.HUBBLE_H / 3.0856775814913673e19          # 1/s
+        hubble = h0 * torch.sqrt(omm.double() * (1 + z.double()) ** 3 + 1 - omm.double())
+        ratio = (torch.gradient(velocity, spacing=cell, dim=-1)[0] / hubble).float()
+        v_factor = 1.0 / (1.0 + ratio.clamp(-self.MAX_DVDR, self.MAX_DVDR))
+        amplitude = 27.0 * (self.OMEGA_B_H2 / 0.023) * torch.sqrt(0.15 / (omm * self.HUBBLE_H ** 2) * (1 + z) / 10.0)
+        spin = 1.0 - torch.exp(u[:, 0].float().clamp(max=self.U_MAX))
+        tb = amplitude * xhi[:, 0].float() * (1 + delta) * spin * v_factor
+        return ((tb - st["tb_offset"]) / st["tb_scale"])[:, None]
+
+
 class IntegralUpdate3d(nn.Module):
     """Gated state-dependent integral interaction, then a pointwise convex update."""
 
@@ -117,7 +167,8 @@ class RhizomeOperator3d(nn.Module):
     """Tied (or untied) recurrent rhizome operator on (B, C_in, X, Y, Z) windows."""
 
     def __init__(self, in_channels, width=48, modes=(24, 24, 16), n_steps=6, step_size=0.5,
-                 los_pad=64, rank=None, untied=False, checkpoint=True, amp=True):
+                 los_pad=64, rank=None, untied=False, checkpoint=True, amp=True,
+                 targets=("neutral_fraction",), tb_head=None, structured=None):
         super().__init__()
         self.in_channels = _integer("in_channels", in_channels)
         self.width = _integer("width", width)
@@ -131,7 +182,18 @@ class RhizomeOperator3d(nn.Module):
         self.lift = nn.Conv3d(in_channels, width, 1)
         self.cells = nn.ModuleList([IntegralUpdate3d(width, tuple(modes), float(step_size), los_pad, rank)
                                     for _ in range(n_steps if untied else 1)])
-        self.decode = nn.Sequential(nn.Conv3d(width, width, 1), nn.GELU(), nn.Conv3d(width, 1, 1))
+        self.targets = tuple(targets)
+        if self.targets[0] != "neutral_fraction" or not set(self.targets) <= {"neutral_fraction", "brightness_temp"}:
+            raise ValueError("targets must start with neutral_fraction, optionally followed by brightness_temp")
+        self.tb_head = tb_head if "brightness_temp" in self.targets else None
+        if "brightness_temp" in self.targets and tb_head not in ("plain", "structured"):
+            raise ValueError("a brightness_temp target needs tb_head 'plain' or 'structured'")
+        if self.tb_head == "structured" and not structured:
+            raise ValueError("tb_head='structured' needs the structured indices/stats config")
+        self.structured = (StructuredBrightness3d(structured["indices"], structured["stats"])
+                           if self.tb_head == "structured" else None)
+        self.decode = nn.Sequential(nn.Conv3d(width, width, 1), nn.GELU(),
+                                    nn.Conv3d(width, len(self.targets), 1))
 
     def forward(self, x, *, logits=False):
         if x.ndim != 5 or x.shape[1] != self.in_channels:
@@ -147,4 +209,9 @@ class RhizomeOperator3d(nn.Module):
                 else:
                     state = cell(state, forcing)
             out = self.decode(state).float()
-        return out if logits else out.sigmoid()
+        xhi = out[:, :1]
+        if self.tb_head is None:
+            return xhi if logits else xhi.sigmoid()
+        # T_b (normalized) outside autocast: the structured head needs float64 dv/dr.
+        tb = out[:, 1:2] if self.tb_head == "plain" else self.structured(x, xhi.sigmoid(), out[:, 1:2])
+        return torch.cat([xhi if logits else xhi.sigmoid(), tb], dim=1)

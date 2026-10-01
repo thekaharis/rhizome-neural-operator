@@ -75,3 +75,71 @@ def test_warm_start_signature_is_backward_compatible():
     assert '"--init-from"' in source and '"--init-optimizer"' in source
     # ...and drops them from the resume signature when unused.
     assert 'signature.pop("init_from", None)' in source
+
+
+STATS = {"density_offset": 0.0, "density_scale": 10.0, "velocity_offset": 0.0, "velocity_scale": 100.0,
+         "tb_offset": -20.0, "tb_scale": 40.0, "omm_mean": 0.3, "omm_std": 0.05}
+INDICES = {"density": 0, "velocity": 1, "z": 2, "omm": 12, "relative": 14}
+
+
+def mf_inputs(batch=1, nz=10):
+    torch.manual_seed(3)
+    x = 0.1 * torch.randn(batch, 16, 8, 8, nz, dtype=torch.float64)
+    x[:, 2] = 1 / (1 + torch.linspace(7, 9, nz, dtype=torch.float64))   # 1/(1+z) along the LOS
+    x[:, 14] = (torch.arange(nz, dtype=torch.float64) * 1.43 / 1000)      # relative LOS position (Gpc)
+    return x
+
+
+def test_multifield_heads_shapes():
+    x = mf_inputs()
+    for head, extra in (("plain", {}), ("structured", {"structured": {"indices": INDICES, "stats": STATS}})):
+        torch.manual_seed(0)
+        model = RhizomeOperator3d(16, width=6, modes=(3, 3, 2), n_steps=2, los_pad=4, amp=False,
+                                  targets=("neutral_fraction", "brightness_temp"), tb_head=head, **extra).double()
+        y = model(x)
+        assert y.shape == (1, 2, 8, 8, 10) and 0 < y[:, 0].min() and y[:, 0].max() < 1
+        logits = model(x, logits=True)
+        assert torch.allclose(logits[:, 0].sigmoid(), y[:, 0]) and torch.allclose(logits[:, 1], y[:, 1])
+
+
+def test_structured_tb_vanishes_where_ionized():
+    from ebm21cm.model.rhizome3d import StructuredBrightness3d
+    head = StructuredBrightness3d(INDICES, STATS)
+    x, u = mf_inputs().float(), torch.randn(1, 1, 8, 8, 10)
+    tb = head(x, torch.zeros(1, 1, 8, 8, 10), u) * STATS["tb_scale"] + STATS["tb_offset"]
+    assert torch.allclose(tb, torch.zeros_like(tb), atol=1e-4)
+
+
+def test_structured_tb_matches_fno_head():
+    import sys
+    from pathlib import Path
+    root = Path("/pfs/10/work/hd_id260-fno_training/fno-21cm")
+    if not (root / "multifield_model.py").exists():
+        pytest.skip("fno-21cm checkout not available")
+    sys.path.insert(0, str(root))
+    try:
+        from multifield_model import StructuredBrightness
+    except Exception as exc:  # pragma: no cover - environment dependent
+        pytest.skip(f"cannot import fno-21cm: {exc}")
+    from ebm21cm.model.rhizome3d import StructuredBrightness3d
+    ours = StructuredBrightness3d(INDICES, STATS)
+    fno = StructuredBrightness((0, 1, 2, 12, 14, 0, 1), STATS)
+    x, u, xhi = mf_inputs().float(), torch.randn(1, 1, 8, 8, 10), torch.rand(1, 1, 8, 8, 10)
+    assert torch.allclose(ours(x, xhi, u), fno(x, xhi, u).float(), atol=1e-5)
+
+
+def test_xhi_only_model_is_unchanged_by_multifield_support():
+    torch.manual_seed(0)
+    model = RhizomeOperator3d(4, width=6, modes=(3, 3, 2), n_steps=2, los_pad=4, amp=False)
+    assert model.decode[-1].out_channels == 1 and model.tb_head is None and model.structured is None
+    assert all(not k.startswith("structured") for k in model.state_dict())
+
+
+def test_multifield_config_validation():
+    with pytest.raises(ValueError):
+        RhizomeOperator3d(4, width=6, modes=(3, 3, 2), targets=("brightness_temp",))
+    with pytest.raises(ValueError):
+        RhizomeOperator3d(4, width=6, modes=(3, 3, 2), targets=("neutral_fraction", "brightness_temp"))
+    with pytest.raises(ValueError):
+        RhizomeOperator3d(4, width=6, modes=(3, 3, 2), targets=("neutral_fraction", "brightness_temp"),
+                          tb_head="structured")

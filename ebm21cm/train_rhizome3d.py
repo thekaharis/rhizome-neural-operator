@@ -8,7 +8,10 @@ imported from ``--fno-root``, so results are directly comparable with its
 LOS-window runs (same 2000-cone preparation and test cones). Only the model,
 objective and schedule differ:
 
-* x_HI only, BCE on the window core (the halo is context, as in fno-21cm);
+* x_HI by BCE on the window core (the halo is context, as in fno-21cm); with
+  ``--targets neutral_fraction,brightness_temp`` also the normalized T_b by
+  MSE (weight ``--tb-weight``), from a plain or physics-structured head;
+* optional fno-21cm emulated global-history input channels (``--history-emulator``);
 * Adam with linear warmup then cosine decay over the step budget;
 * optional transverse dihedral + periodic-shift augmentation (exact symmetries);
 * per-epoch validation on fno-21cm's stratified validation subset, with the
@@ -79,6 +82,50 @@ def masked_bce(logits, target, mask):
     return (loss * mask).sum() / mask.sum()
 
 
+def masked_mse(pred, target, mask):
+    loss = (pred - target) ** 2
+    mask = mask.expand_as(loss).to(loss.dtype)
+    return (loss * mask).sum() / mask.sum()
+
+
+# Options added for multi-field runs. At these defaults they are left out of the
+# resume signature, so x_HI-only runs started before they existed still resume.
+MULTIFIELD_DEFAULTS = {"inputs": "density", "targets": "neutral_fraction", "history_emulator": "",
+                       "tb_head": "plain", "tb_weight": 1.0, "monitor": "neutral_fraction"}
+
+
+def structured_config(mapping, normalization, parameter_normalization, param_names):
+    """Channel indices and statistics for StructuredBrightness3d, as fno-21cm derives them."""
+    for name in ("density", "los_velocity"):
+        if name not in mapping.inputs:
+            raise ValueError(f"the structured T_b head needs {name} as an input")
+    if list(parameter_normalization.names) != list(param_names):
+        raise ValueError("parameter normalization order differs from the input channels")
+    n_in = len(mapping.inputs)
+    omm = list(param_names).index("OMm")
+    return {"indices": {"density": mapping.inputs.index("density"), "velocity": mapping.inputs.index("los_velocity"),
+                        "z": n_in, "omm": n_in + 1 + omm, "relative": n_in + 1 + len(param_names)},
+            "stats": {"density_offset": normalization["density"]["offset"],
+                      "density_scale": normalization["density"]["scale"],
+                      "velocity_offset": normalization["los_velocity"]["offset"],
+                      "velocity_scale": normalization["los_velocity"]["scale"],
+                      "tb_offset": normalization["brightness_temp"]["offset"],
+                      "tb_scale": normalization["brightness_temp"]["scale"],
+                      "omm_mean": float(parameter_normalization.mean[omm]),
+                      "omm_std": float(parameter_normalization.std[omm])}}
+
+
+def install_histories(fm, dataset, spec, fno_root):
+    """Append fno-21cm emulated global-history channels; returns their descriptions."""
+    described = []
+    for path in [q for q in spec.replace(":", ",").split(",") if q]:
+        path = Path(path) if Path(path).is_absolute() else Path(fno_root) / path
+        emulator = fm.HistoryEmulator(str(path))
+        dataset.install_history(emulator)
+        described.append(emulator.describe())
+    return described
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--run-dir", required=True)
@@ -115,14 +162,28 @@ def main(argv=None):
                    help="warm start a NEW run from another run's last.pt/best.pt weights (same model config)")
     p.add_argument("--init-optimizer", action="store_true",
                    help="with --init-from and a last.pt: also load its Adam state")
+    p.add_argument("--inputs", default=MULTIFIELD_DEFAULTS["inputs"], help="input fields, e.g. density,los_velocity")
+    p.add_argument("--targets", default=MULTIFIELD_DEFAULTS["targets"],
+                   help="neutral_fraction, optionally followed by ,brightness_temp")
+    p.add_argument("--history-emulator", default=MULTIFIELD_DEFAULTS["history_emulator"],
+                   help="comma-separated fno-21cm global-history emulators (relative to --fno-root)")
+    p.add_argument("--tb-head", choices=("plain", "structured"), default=MULTIFIELD_DEFAULTS["tb_head"])
+    p.add_argument("--tb-weight", type=float, default=MULTIFIELD_DEFAULTS["tb_weight"],
+                   help="weight of the normalized T_b MSE relative to the x_HI BCE")
+    p.add_argument("--monitor", choices=("neutral_fraction", "mean"), default=MULTIFIELD_DEFAULTS["monitor"],
+                   help="model selection: x_HI RMSE, or the weighted mean normalized MSE over targets (fno-21cm)")
     args = p.parse_args(argv)
 
     fm, FieldMapping, FieldRegistry, LOSWindowConfig, LOSWindowDataset = fno_pipeline(args.fno_root)
     preparation_path = Path(args.preparation or Path(args.fno_root) / "experiments/los_windows/preparation_xhi_2000.json")
     preparation = fm.read_json(preparation_path)
     registry = FieldRegistry.from_dict(preparation["registry"])
-    mapping = FieldMapping.create(["density"], ["neutral_fraction"], preparation["conditioning"], registry)
+    mapping = FieldMapping.create(args.inputs.split(","), args.targets.split(","), preparation["conditioning"], registry)
+    if mapping.targets[0] != "neutral_fraction":
+        raise ValueError("the first target must be neutral_fraction")
+    multifield = "brightness_temp" in mapping.targets
     dataset, rows, _ = fm.prepared_dataset(preparation, mapping)
+    histories = install_histories(fm, dataset, args.history_emulator, args.fno_root)
     norm = dataset.normalization["neutral_fraction"]
     if norm["offset"] != 0.0 or norm["scale"] != 1.0:
         raise ValueError("x_HI must be un-normalized (offset 0, scale 1) for a sigmoid output")
@@ -135,6 +196,13 @@ def main(argv=None):
     model_config = {"in_channels": dataset.in_channels, "width": args.width, "modes": list(args.modes),
                     "n_steps": args.updates, "step_size": args.step_size, "los_pad": args.los_pad,
                     "rank": args.rank or None, "checkpoint": not args.no_checkpoint, "amp": not args.no_amp}
+    if multifield:  # x_HI-only configs stay exactly as before
+        from dataset.lightcone_params import PARAM_NAMES
+
+        model_config.update({"targets": list(mapping.targets), "tb_head": args.tb_head,
+                             "structured": structured_config(mapping, dataset.normalization,
+                                                             dataset.parameter_normalization, PARAM_NAMES)
+                             if args.tb_head == "structured" else None})
     model = RhizomeOperator3d(**model_config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     train_windows = LOSWindowDataset(dataset, rows["train"], window, args.seed, augment=args.augment)
@@ -149,6 +217,9 @@ def main(argv=None):
     if not args.init_from:
         signature.pop("init_from", None)
         signature.pop("init_optimizer", None)
+    for key, default in MULTIFIELD_DEFAULTS.items():
+        if signature.get(key) == default:
+            signature.pop(key)
     state = {"epoch": 0, "position": 0, "step": 0, "best_val_rmse": float("inf"), "best_epoch": None,
              "elapsed": 0.0, "history": []}
     last = run_dir / "last.pt"
@@ -188,7 +259,12 @@ def main(argv=None):
             "preparation": str(preparation_path.resolve()), "input_channels": list(dataset.channel_names),
             "window": window.to_dict(), "splits": {k: len(v) for k, v in rows.items()},
             "steps_per_epoch": steps_per_epoch, "total_steps": total_steps,
-            "objective": "BCE on window core (halo excluded), x_HI only",
+            "objective": ("BCE(x_HI) + tb_weight * MSE(normalized T_b) on window core (halo excluded)"
+                          if multifield else "BCE on window core (halo excluded), x_HI only"),
+            "mapping": {"inputs": list(mapping.inputs), "targets": list(mapping.targets),
+                        "conditioning": preparation["conditioning"]},
+            "history_emulator": histories or None, "history_spec": args.history_emulator or None,
+            "monitor": args.monitor, "tb_weight": args.tb_weight if multifield else None,
             "git_commit": git_commit(root), "fno_git_commit": git_commit(Path(args.fno_root)),
             "torch": str(torch.__version__), "device": torch.cuda.get_device_name() if cuda else "cpu",
             "init_from": None if warm is None else {
@@ -208,9 +284,21 @@ def main(argv=None):
                     "cuda_rng": torch.cuda.get_rng_state_all() if cuda else []}, tmp)
         tmp.replace(path)
 
+    weights = {"neutral_fraction": 1.0, "brightness_temp": args.tb_weight}
+
     def validate():
-        result = fm.evaluate_rows(model, dataset, val_rows, device, 1, 0, 0, window)["neutral_fraction"]
-        return {k: result[k] for k in ("rmse", "mae", "normalized_mse", "mean_bias", "pearson_r")}
+        """x_HI metrics (keys as before), T_b metrics prefixed tb_, and the selection score."""
+        result = fm.evaluate_rows(model, dataset, val_rows, device, 1, 0, 0, window)
+        keys = ("rmse", "mae", "normalized_mse", "mean_bias", "pearson_r")
+        val = {k: result["neutral_fraction"][k] for k in keys}
+        if multifield:
+            val.update({f"tb_{k}": result["brightness_temp"][k] for k in keys})
+        if args.monitor == "mean":
+            val["score"] = sum(result[n]["normalized_mse"] * weights[n] for n in mapping.targets) / \
+                sum(weights[n] for n in mapping.targets)
+        else:
+            val["score"] = val["rmse"]
+        return val
 
     wall = time.monotonic()
     last_save = wall
@@ -230,7 +318,10 @@ def main(argv=None):
             y = batch["y"].to(device, non_blocking=True)
             mask = batch["loss_mask"].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            loss = masked_bce(model(x, logits=True), y, mask)
+            out = model(x, logits=True)
+            loss = masked_bce(out[:, :1], y[:, :1], mask)
+            if multifield:
+                loss = loss + args.tb_weight * masked_mse(out[:, 1:2], y[:, 1:2], mask)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite loss at step {state['step']}")
             loss.backward()
@@ -243,7 +334,7 @@ def main(argv=None):
             if state["step"] % 200 == 0:
                 rate = window_n / (time.monotonic() - tick)
                 print(f"epoch {state['epoch']} {state['position']}/{steps_per_epoch} step {state['step']} "
-                      f"bce {window_loss / window_n:.5f} lr {optimizer.param_groups[0]['lr']:.2e} "
+                      f"{'loss' if multifield else 'bce'} {window_loss / window_n:.5f} lr {optimizer.param_groups[0]['lr']:.2e} "
                       f"{rate:.2f} win/s", flush=True)
                 window_loss, window_n, tick = 0.0, 0, time.monotonic()
             now = time.monotonic()
@@ -260,11 +351,14 @@ def main(argv=None):
         val = validate()
         record = {"epoch": state["epoch"], "step": state["step"], **{f"val_{k}": v for k, v in val.items()}}
         state["history"].append(record)
-        if val["rmse"] < state["best_val_rmse"]:
-            state["best_val_rmse"], state["best_epoch"] = val["rmse"], state["epoch"]
+        # "best_val_rmse" holds the selection score (x_HI RMSE unless --monitor mean).
+        if val["score"] < state["best_val_rmse"]:
+            state["best_val_rmse"], state["best_epoch"] = val["score"], state["epoch"]
             torch.save({"model": model.state_dict(), "model_config": model_config, "epoch": state["epoch"],
                         "val": val}, run_dir / "best.pt")
-        print(f"epoch {state['epoch']} done: val rmse {val['rmse']:.5f} nmse {val['normalized_mse']:.5f} "
+        tb = f" tb_rmse {val['tb_rmse']:.4f} tb_nmse {val['tb_normalized_mse']:.5f}" if multifield else ""
+        sel = f" score {val['score']:.5f}" if args.monitor == "mean" else ""
+        print(f"epoch {state['epoch']} done: val rmse {val['rmse']:.5f} nmse {val['normalized_mse']:.5f}{tb}{sel} "
               f"(best {state['best_val_rmse']:.5f} @ {state['best_epoch']})", flush=True)
         (run_dir / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in state["history"]))
         state["epoch"] += 1
@@ -285,10 +379,14 @@ def main(argv=None):
     best = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
     model.load_state_dict(best["model"])
     for split, name in (("val", "val_full_metrics.json"), ("test", "test_metrics.json")):
+        if (run_dir / name).exists():  # e.g. an evaluation interrupted between the two splits
+            print(f"{split}: {name} exists, skipped", flush=True)
+            continue
         result = fm.evaluate_rows(model, dataset, rows[split], device, 1, 0, 12, window)
         (run_dir / name).write_text(json.dumps({"checkpoint": "best.pt", "epoch": best["epoch"], "split": split,
                                                 "fields": result}, indent=2, default=float))
-        print(f"{split}: rmse {result['neutral_fraction']['rmse']:.5f}", flush=True)
+        print(f"{split}: rmse {result['neutral_fraction']['rmse']:.5f}"
+              + (f" tb_rmse {result['brightness_temp']['rmse']:.4f}" if multifield else ""), flush=True)
 
 
 if __name__ == "__main__":
