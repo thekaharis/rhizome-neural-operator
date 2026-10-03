@@ -4,6 +4,7 @@
 # The suite needs identical ordered cones and truth across models, so the manifests
 # are merged on their shared cones first (truth equality is checked).
 #   sbatch --export=ALL,NAME=rhizome_vs_fno,MANIFESTS="a/manifest.json b/manifest.json" slurm/eval3d_suite.sbatch
+# DTB=1 adds the model-own dT_b physical evaluation (multi-field exports only).
 #SBATCH --job-name=rhz-eval3d
 #SBATCH --partition=compute
 #SBATCH --nodes=1
@@ -50,6 +51,12 @@ REF=$(python -c "import json;print(next(iter(json.load(open('$OUT/manifest.json'
 cd "$FNO_ROOT"
 run() { echo "=== $* ($(date +%T))"; "$@" || echo "!!! failed: $1 $2"; }
 run python -m viz.physical_evaluation --manifest "$OUT/manifest.json" --out "$OUT/physical"
+# DTB=1 (all models export tb_pred): also score each model's own dT_b, with a
+# pre-reionization stage that covers the absorption trough.
+if [ "${DTB:-0}" = 1 ]; then
+    run python -m viz.physical_evaluation --manifest "$OUT/manifest.json" --out "$OUT/physical_dtb" \
+        --dtb-from-npz --stage-edges 0.02 0.2 0.4 0.6 0.8 0.98 1.001
+fi
 run python -m viz.bubble_size_evaluation --manifest "$OUT/manifest.json" --out "$OUT/bubble_size"
 run python -m viz.power_spectrum_evaluation --manifest "$OUT/manifest.json" --out "$OUT/power_spectrum"
 run python -m viz.boundary_band_diagnostic --manifest "$OUT/manifest.json" --mode slice --reference "$REF" --out "$OUT/edge_slice"

@@ -39,6 +39,8 @@ BACKGROUND_SLICES="${BACKGROUND_SLICES:-0}"
 # skip | clip: 178 cones exceed float16 T_b (|T_b| > 6e4 mK) in sampled slices;
 # "clip" keeps them (for x_HI work) and lists them in the tb_clipped attribute.
 TB_OVERFLOW="${TB_OVERFLOW:-skip}"
+# Optional: SPLIT_FROM=<fno-21cm preparation JSON> uses that preparation's cones and split.
+SPLIT_FROM="${SPLIT_FROM:-}"
 N_SHARDS="${SLURM_ARRAY_TASK_COUNT:?submit as an array job}"
 SHARD="${SLURM_ARRAY_TASK_ID:?submit as an array job}"
 
@@ -49,5 +51,6 @@ echo "shard $SHARD/$N_SHARDS  $LIGHTCONES/$PATTERN -> $OUT  ($(date))"
 python -m ebm21cm.data.cache build --data "$LIGHTCONES" --pattern "$PATTERN" --out "$OUT" \
     --slices-per-cone "$SLICES_PER_CONE" --bands="$BANDS" --z-min "$Z_MIN" --z-max "$Z_MAX" \
     --shard "$SHARD" --n-shards "$N_SHARDS" --tb-overflow "$TB_OVERFLOW" \
-    ${XHI_WINDOW:+--xhi-window "$XHI_WINDOW" --background-slices "$BACKGROUND_SLICES"}
+    ${XHI_WINDOW:+--xhi-window "$XHI_WINDOW" --background-slices "$BACKGROUND_SLICES"} \
+    ${SPLIT_FROM:+--split-from "$SPLIT_FROM"}
 echo "done $(date)"
