@@ -78,21 +78,23 @@ value, not output sensitivities.}
 Network:
 
 ```latex
-\caption{How cells exchange information. Nodes are an $8\times8$ lattice of
-cells on the same validation slice; grey is the true neutral region.
-(a)~A U-Net-style hierarchy: information moves through coarse parent nodes,
-so two neighbouring cells on either side of a block boundary (green) meet only
-at the root. (b)~An ungated global kernel, as in a Fourier layer, here the
-trained rhizome's own $\kappa_\theta$ with $\mathbf A=\mathbf B=\mathbf 1$:
-every cell is connected to every other, with the same pattern around each
-cell. (c)~The trained rhizome at update $t=4$: edge $(i,j)$ carries
+\caption{How cells exchange information, on an $8\times8$ lattice of cells
+of the same validation slice (shaded: true neutral region). (a)~A
+U-Net-style hierarchy: information moves through coarse parent nodes, so two
+neighbouring cells on either side of a block boundary (green) meet only at
+the root. (b)~An ungated global kernel, as in a Fourier layer, here the
+trained rhizome's own $\kappa_\theta$ with $\mathbf A=\mathbf B=\mathbf 1$.
+Lines show the incoming connections of four cells; every cell is reached by
+every other, and the pattern is identical around each cell. (c)~The trained
+rhizome at update $t=4$, for the same four cells: edge $j\to i$ carries
 $\|\mathrm{diag}(\mathbf A_i)\,\kappa_\theta(\mathbf r_i-\mathbf
-r_j)\,\mathrm{diag}(\mathbf B_j)\|_F$, so the same all-to-all web is
-re-weighted cell by cell from the current state. Ring size shows the receiver
-gate, fill the source gate. Green edges are the incoming connections of one
-cell. Edge width and opacity show the geometric mean of the two directed
-weights relative to the panel maximum; edges crossing the periodic boundary
-are omitted for clarity.}
+r_j)\,\mathrm{diag}(\mathbf B_j)\|_F$, so it is scaled by both the
+receiver's gate (ring; channel RMS printed) and the sender's gate (dot shade;
+channel RMS, which spans only $1.04$--$1.12$ and is stretched over the full
+shade range). The receiver gate scales a whole fan by $0.55$--$1.49$; sender
+gates re-weight individual edges within a fan by $0.88$--$1.21$. Width and
+opacity are relative to each panel's maximum; edges below 10\% of it, and
+edges crossing the periodic boundary, are omitted.}
 ```
 
 ## What the mechanism figure shows, and what it does not
@@ -113,12 +115,21 @@ are omitted for clarity.}
 
 ## What the network figure shows, and what it does not
 
-- Total incoming strength varies across cells by a coefficient of variation
-  of 0.32 in the rhizome, against exactly 0 for the ungated kernel. Outgoing
-  strength varies far less (0.04): in this checkpoint the heterogeneity comes
-  mostly from the receiver gates, not the senders.
+- Every edge j → i is scaled by both gates, A_i and B_j, channel by channel.
+  In this checkpoint their sizes differ a lot. Splitting the log of the gate
+  factor (edge weight / ungated kernel weight) over all lattice pairs, the
+  receiver-only part has variance 0.117 and the sender-only part 0.002, of a
+  total 0.125. A receiver's gate scales its whole fan by 0.55–1.49; senders'
+  gates move individual edges within a fan by 0.88–1.21.
+- Consequently, total incoming strength varies across cells by a coefficient
+  of variation of 0.32 (exactly 0 for the ungated kernel) and correlates 0.997
+  with the receiver-gate RMS, while outgoing strength varies far less (0.04).
+  The small sender effect is a property of this trained model, not of the
+  architecture.
 - Directed weights differ: the median of |w_ij − w_ji| / (w_ij + w_ji) is
-  0.17, which panel (c) does not show because it draws undirected edges.
+  0.17. Panels (b) and (c) show incoming edges only, for four receivers
+  chosen to include the strongest and weakest listener; the statistics above
+  are over all lattice pairs.
 - Panel (a) is a schematic of 2×2 pooling, not a trained U-Net. Real U-Nets
   also have skip connections and overlapping convolution stencils, so
   neighbouring cells do interact at the finest level through the stencil;
