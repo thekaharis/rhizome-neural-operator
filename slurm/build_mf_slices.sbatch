@@ -1,6 +1,7 @@
 #!/bin/bash
 # Array job: one multi-field slice-cache shard per task (ebm21cm.data.mf_slices),
-# read through fno-21cm's multi-field preparation. Then merge:
+# read through fno-21cm's multi-field preparation (PREPARATION=... to override;
+# CLEAN_TB=1 rebuilds T_b from raw files). Then merge:
 #   AID=$(sbatch --parsable slurm/build_mf_slices.sbatch)
 #   sbatch --dependency=afterok:$AID --export=ALL,MODE=merge slurm/build_mf_slices.sbatch   (as a non-array job)
 #SBATCH --job-name=mf-slices
@@ -24,6 +25,7 @@ if [ "${MODE:-build}" = merge ]; then
 else
     N="${SLURM_ARRAY_TASK_COUNT:?submit as an array job}"; S="${SLURM_ARRAY_TASK_ID:?}"
     python -m ebm21cm.data.mf_slices build --out "$SHARD_DIR/shard$(printf %03d "$S").h5" --shard "$S" --n-shards "$N" \
-        --slices-per-cone "${SLICES_PER_CONE:-48}" --background-slices "${BACKGROUND_SLICES:-6}"
+        --slices-per-cone "${SLICES_PER_CONE:-48}" --background-slices "${BACKGROUND_SLICES:-6}" \
+        ${PREPARATION:+--preparation "$PREPARATION"} ${CLEAN_TB:+--clean-tb}
 fi
 echo "done $(date)"

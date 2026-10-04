@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -68,7 +69,10 @@ def band_means(values, centers, bands):
 
 def build(out, shard=0, n_shards=1, preparation=PREPARATION, fno_root=FNO_ROOT, history=HISTORY,
           slices_per_cone=48, background_slices=6, xhi_window=(0.02, 0.98), bands=DEFAULT_BANDS,
-          z_range=(5.001, 24.97), chunk=512, sample_seed=0, limit=None, log=print):
+          z_range=(5.001, 24.97), chunk=512, sample_seed=0, limit=None, clean_tb=False, log=print):
+    """``clean_tb`` rebuilds T_b from raw (un-clipped) files with fno-21cm's
+    ``tools_clean_brightness_temp.clean``, exactly as its cleaned mirror was made;
+    cones that still fail (non-finite or float16 overflow) are skipped and listed."""
     bands = parse_bands(bands) if isinstance(bands, str) else [tuple(b) for b in bands]
     below, above = band_extent(bands)
     halo = max(below, above + 1)
@@ -94,39 +98,57 @@ def build(out, shard=0, n_shards=1, preparation=PREPARATION, fno_root=FNO_ROOT, 
              "scalars": mk("scalars", (1 + len(param_names) + 2 * len(bands),), np.float32),
              "z": mk("z", (), np.float64), "los_index": mk("los_index", (), np.int32),
              "cone_id": mk("cone_id", (), np.int64), "split": mk("split", (), np.int8)}
+        skipped = []
+        if clean_tb:
+            from tools_clean_brightness_temp import clean
         for k, row in enumerate(mine):
-            cid = int(dataset.cone_ids[row])
-            z = np.asarray(dataset.redshifts[row])
-            history_xhi = dataset.read_fields(row, names=["neutral_fraction"])["neutral_fraction"].mean((0, 1))
-            rng = np.random.default_rng([sample_seed, cid])
-            idx = np.sort(pick_window_indices(z, history_xhi, below, above, slices_per_cone, background_slices,
-                                              xhi_window, z_range, rng))
-            parts = {key: [] for key in d}
-            for start in range(0, len(z), chunk):
-                sel = idx[(idx >= start) & (idx < start + chunk)]
-                if sel.size == 0:
-                    continue
-                sample = dataset.window(row, start - halo, config)
-                x, y = sample["x"], sample["y"]
-                with torch.no_grad():
-                    phys = head.physical_factor(x[None])[0].numpy()
-                x = x.numpy()
-                j = sel - start + halo
-                parts["cond"].append(np.concatenate([band_means(x[0], j, bands), band_means(x[1], j, bands)], 1))
-                hist = np.concatenate([band_means(x[-2, 0, 0], j, bands), band_means(x[-1, 0, 0], j, bands)], 1)
-                parts["scalars"].append(np.concatenate([x[2, 0, 0, j][:, None], x[ip, 0, 0][:, j].T, hist], 1))
-                parts["phys"].append(np.moveaxis(phys[..., j], -1, 0))
-                parts["xhi"].append(np.moveaxis(y[0].numpy()[..., j], -1, 0))
-                parts["tb"].append(np.moveaxis(y[1].numpy()[..., j], -1, 0))
-            n = idx.size
-            values = {key: np.concatenate(v) for key, v in parts.items() if v}
-            values.update({"z": z[idx], "los_index": idx, "cone_id": np.full(n, cid),
-                           "split": np.full(n, split_of[row])})
+            # Sample id from the file name (fno-21cm's cone_ids are row indices).
+            cid = int(re.findall(r"\d+", Path(dataset.file_paths[row]).stem)[-1])
+            try:
+                z = np.asarray(dataset.redshifts[row])
+                names = ["neutral_fraction"] + (["brightness_temp", "los_velocity"] if clean_tb else [])
+                full = dataset.read_fields(row, names=names)
+                history_xhi = full["neutral_fraction"].mean((0, 1))
+                if clean_tb:
+                    omm = float(dataset.params[row][param_names.index("OMm")])
+                    tb_clean, _ = clean(full["brightness_temp"], full["los_velocity"], np.asarray(dataset.distances[row]),
+                                        z, omm)
+                    norm = dataset.normalization["brightness_temp"]
+                    tb_norm = (tb_clean.astype(np.float64) - norm["offset"]) / norm["scale"]
+                rng = np.random.default_rng([sample_seed, cid])
+                idx = np.sort(pick_window_indices(z, history_xhi, below, above, slices_per_cone, background_slices,
+                                                  xhi_window, z_range, rng))
+                parts = {key: [] for key in d}
+                for start in range(0, len(z), chunk):
+                    sel = idx[(idx >= start) & (idx < start + chunk)]
+                    if sel.size == 0:
+                        continue
+                    sample = dataset.window(row, start - halo, config)
+                    x, y = sample["x"], sample["y"]
+                    with torch.no_grad():
+                        phys = head.physical_factor(x[None])[0].numpy()
+                    x = x.numpy()
+                    j = sel - start + halo
+                    parts["cond"].append(np.concatenate([band_means(x[0], j, bands), band_means(x[1], j, bands)], 1))
+                    hist = np.concatenate([band_means(x[-2, 0, 0], j, bands), band_means(x[-1, 0, 0], j, bands)], 1)
+                    parts["scalars"].append(np.concatenate([x[2, 0, 0, j][:, None], x[ip, 0, 0][:, j].T, hist], 1))
+                    parts["phys"].append(np.moveaxis(phys[..., j], -1, 0))
+                    parts["xhi"].append(np.moveaxis(y[0].numpy()[..., j], -1, 0))
+                    parts["tb"].append(np.moveaxis(tb_norm[..., sel] if clean_tb else y[1].numpy()[..., j], -1, 0))
+                n = idx.size
+                values = {key: np.concatenate(v) for key, v in parts.items() if v}
+                values.update({"z": z[idx], "los_index": idx, "cone_id": np.full(n, cid),
+                               "split": np.full(n, split_of[row])})
+                for key, v in values.items():
+                    if not np.all(np.isfinite(v)):
+                        raise ValueError(f"non-finite {key}")
+                    if d[key].dtype == np.float16 and np.abs(v).max() > 6.0e4:
+                        raise ValueError(f"{key} overflows float16")
+            except (ValueError, OSError, KeyError) as e:
+                skipped.append([cid, f"{type(e).__name__}: {e}"])
+                log(f"[{k + 1}/{len(mine)}] cone {cid}: skipped ({e})")
+                continue
             for key, v in values.items():
-                if not np.all(np.isfinite(v)):
-                    raise ValueError(f"cone {cid}: non-finite {key}")
-                if d[key].dtype == np.float16 and np.abs(v).max() > 6.0e4:
-                    raise ValueError(f"cone {cid}: {key} overflows float16")
                 d[key].resize(n_rows + n, axis=0)
                 d[key][n_rows:n_rows + n] = v.astype(d[key].dtype)
             n_rows += n
@@ -139,7 +161,8 @@ def build(out, shard=0, n_shards=1, preparation=PREPARATION, fno_root=FNO_ROOT, 
                         "preparation": str(preparation), "history": history, "slices_per_cone": slices_per_cone,
                         "background_slices": background_slices, "xhi_window": json.dumps(list(xhi_window)),
                         "z_range": json.dumps(list(z_range)), "sample_seed": sample_seed,
-                        "shard": shard, "n_shards": n_shards, "transverse_shape": json.dumps([H, W])})
+                        "shard": shard, "n_shards": n_shards, "transverse_shape": json.dumps([H, W]),
+                        "clean_tb": int(clean_tb), "skipped": json.dumps(skipped), "cone_id": "sample id"})
     os.replace(tmp, out)
     log(f"wrote {n_rows} rows to {out}")
 
@@ -175,7 +198,12 @@ def merge(shards, out, log=print):
                         o[k][pos + a:pos + min(n, a + 256)] = h[k][a:min(n, a + 256)]
                 pos += n
         o.attrs.update(ref)
-        o.attrs.update({"merged_from": json.dumps([str(s) for s in shards]), "n_cones": len(seen)})
+        skipped = []
+        for s in shards:
+            with h5py.File(s, "r") as h:
+                skipped += json.loads(h.attrs.get("skipped", "[]"))
+        o.attrs.update({"merged_from": json.dumps([str(s) for s in shards]), "n_cones": len(seen),
+                        "skipped": json.dumps(skipped)})
     os.replace(tmp, out)
     log(f"merged {len(shards)} shards, {total} rows from {len(seen)} cones -> {out}")
 
@@ -252,13 +280,14 @@ def main(argv=None):
     b.add_argument("--slices-per-cone", type=int, default=48)
     b.add_argument("--background-slices", type=int, default=6)
     b.add_argument("--limit", type=int, default=None)
+    b.add_argument("--clean-tb", action="store_true", help="rebuild T_b from raw files (fno-21cm's cleaning)")
     m = sub.add_parser("merge")
     m.add_argument("--out", required=True)
     m.add_argument("shards", nargs="+")
     a = ap.parse_args(argv)
     if a.cmd == "build":
         build(a.out, a.shard, a.n_shards, a.preparation, a.fno_root, a.history, a.slices_per_cone,
-              a.background_slices, limit=a.limit, log=lambda s: print(s, flush=True))
+              a.background_slices, limit=a.limit, clean_tb=a.clean_tb, log=lambda s: print(s, flush=True))
     else:
         merge(a.shards, a.out)
 

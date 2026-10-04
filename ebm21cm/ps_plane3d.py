@@ -93,6 +93,7 @@ def main(argv=None):
     ap.add_argument("--rename", nargs="*", default=[], help="model=label pairs for the point labels")
     ap.add_argument("--label-offset", nargs="*", default=[], metavar="LABEL=DX,DY",
                     help="fixed label offsets in points (negative DX: label left of the point)")
+    ap.add_argument("--legend-loc", default="upper left")
     ap.add_argument("--note", default="")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args(argv)
@@ -121,7 +122,7 @@ def main(argv=None):
     for s in ax.spines.values():
         s.set_color(GRID)
     ax.tick_params(colors=INK_2)
-    ax.legend(frameon=False, loc="upper left", fontsize=9)
+    ax.legend(frameon=False, loc=args.legend_loc, fontsize=9)
     if args.note:
         fig.text(0.01, 0.01, args.note, fontsize=7.5, color=INK_MUTED, ha="left", va="bottom", wrap=True)
     fig.tight_layout(rect=(0, 0.06 if args.note else 0, 1, 1))
