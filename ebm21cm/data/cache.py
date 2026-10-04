@@ -165,7 +165,8 @@ def discover(data: str | Path, pattern: str) -> list[Path]:
 def build(files, out, slices_per_cone=8, bands=DEFAULT_BANDS, z_range=None, split_seed=42,
           param_names=DEFAULT_PARAM_NAMES, missing_params="raise", dtype="float16",
           shard=0, n_shards=1, sample_seed=0, compute_stats_after=True, log=print,
-          xhi_window=None, background_slices=0, chunk_cache_bytes=None, tb_overflow="skip"):
+          xhi_window=None, background_slices=0, chunk_cache_bytes=None, tb_overflow="skip",
+          split_of=None, split_source=None):
     """``xhi_window=(lo, hi)`` concentrates ``slices_per_cone`` rows on the LOS
     indices where the cone's mean x_HI lies in [lo, hi] and adds
     ``background_slices`` rows from the rest of the admissible range. Without
@@ -175,6 +176,9 @@ def build(files, out, slices_per_cone=8, bands=DEFAULT_BANDS, z_range=None, spli
     range, clipping T_b to +-6e4 mK and listing them in the ``tb_clipped``
     attribute (their T_b is then excluded from the /stats normalization).
     The default ``"skip"`` drops such cones. x_HI and density are never clipped.
+
+    ``split_of`` ({cone id: 0/1/2}, e.g. from ``split_from_preparation``) replaces
+    the seeded 80/10/10 split; cones it does not list are not read.
     """
     if tb_overflow not in ("skip", "clip"):
         raise ValueError("tb_overflow must be 'skip' or 'clip'")
@@ -186,7 +190,14 @@ def build(files, out, slices_per_cone=8, bands=DEFAULT_BANDS, z_range=None, spli
     bands_l = parse_bands(bands) if isinstance(bands, str) else [tuple(b) for b in bands]
     below, above = band_extent(bands_l)
     ids = cone_ids_for(files)
-    split_of = assign_splits(ids, split_seed)  # global, before sharding
+    if split_of is None:
+        split_of = assign_splits(ids, split_seed)  # global, before sharding
+    else:
+        split_of = {int(k): int(v) for k, v in split_of.items()}
+        missing = set(split_of) - set(ids)
+        if missing:
+            raise ValueError(f"{len(missing)} cones of the given split have no file, e.g. {sorted(missing)[:5]}")
+        files, ids = map(list, zip(*[(f, c) for f, c in zip(files, ids) if c in split_of]))
     mine = [(f, c) for j, (f, c) in enumerate(zip(files, ids)) if j % n_shards == shard]
 
     out = Path(out)
@@ -282,6 +293,7 @@ def build(files, out, slices_per_cone=8, bands=DEFAULT_BANDS, z_range=None, spli
             "sources": json.dumps([str(f) for f, _ in mine]), "skipped": json.dumps(skipped),
             "tb_clipped": json.dumps(tb_clipped),
             "split_of": json.dumps({str(k): v for k, v in split_of.items()}),
+            "split_source": json.dumps(split_source),
         })
     os.replace(tmp, out)
     for f, why in skipped:
@@ -294,11 +306,20 @@ def build(files, out, slices_per_cone=8, bands=DEFAULT_BANDS, z_range=None, spli
     return out
 
 
+def split_from_preparation(path) -> dict[int, int]:
+    """{cone id: 0 train / 1 val / 2 test} of an fno-21cm LOS-window preparation JSON."""
+    prep = json.loads(Path(path).read_text())
+    ids = prep["source"]["cone_ids"]
+    codes = {"train": 0, "val": 1, "test": 2}
+    return {int(ids[row]): codes[name] for name, rows in prep["split"].items() for row in rows}
+
+
 def merge(shards, out, log=print):
     shards = [Path(s) for s in shards]
     keys = ("delta", "xhi", "tb", "z", "los_index", "los_spacing_mpc", "cone_id", "split", "params")
     fixed = ("schema", "bands", "param_names", "cell_size_mpc", "shape", "split_seed",
-             "sample_seed", "slices_per_cone", "z_range", "split_of", "xhi_window", "background_slices")
+             "sample_seed", "slices_per_cone", "z_range", "split_of", "xhi_window", "background_slices",
+             "split_source")
     with h5py.File(shards[0], "r") as h0:
         # Caches written before the reionization-window option lack its attributes.
         ref = {a: h0.attrs[a] for a in fixed if a in h0.attrs}
@@ -545,6 +566,8 @@ def main(argv=None):
     b.add_argument("--z-min", type=float)
     b.add_argument("--z-max", type=float)
     b.add_argument("--split-seed", type=int, default=42)
+    b.add_argument("--split-from", help="fno-21cm preparation JSON whose train/val/test cones to use "
+                   "(replaces the seeded split; other cones are skipped)")
     b.add_argument("--sample-seed", type=int, default=0)
     b.add_argument("--param-names", default=",".join(DEFAULT_PARAM_NAMES))
     b.add_argument("--missing-params", choices=("raise", "nan"), default="raise")
@@ -578,7 +601,9 @@ def main(argv=None):
               tuple(n for n in a.param_names.split(",") if n), a.missing_params, a.dtype,
               a.shard, a.n_shards, a.sample_seed, xhi_window=window,
               background_slices=a.background_slices, chunk_cache_bytes=a.chunk_cache_mb * 2**20,
-              tb_overflow=a.tb_overflow)
+              tb_overflow=a.tb_overflow,
+              split_of=split_from_preparation(a.split_from) if a.split_from else None,
+              split_source=a.split_from)
     elif a.cmd == "merge":
         merge(a.shards, a.out)
     else:

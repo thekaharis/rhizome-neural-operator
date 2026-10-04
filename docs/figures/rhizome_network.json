@@ -1,0 +1,81 @@
+{
+  "checkpoint": ".delta/worktrees/jav8yay7g827/ebm-21cm/runs/rhizome_long_seed1/fit/best.pt",
+  "checkpoint_step": 8200,
+  "split": "validation",
+  "row": 252,
+  "cone_id": 63,
+  "redshift": 10.554571502142819,
+  "update_shown": 4,
+  "lattice_nodes": 64,
+  "lattice_step_cells": 4,
+  "receivers_yx": [
+    [
+      26,
+      6
+    ],
+    [
+      6,
+      22
+    ],
+    [
+      10,
+      6
+    ],
+    [
+      22,
+      22
+    ]
+  ],
+  "receiver_gate_rms": [
+    1.4932733228203103,
+    0.5388986731312083,
+    0.8590015267173715,
+    0.9483953478963455
+  ],
+  "edges_drawn_kernel": 140,
+  "edges_drawn_rhizome": 128,
+  "edge_threshold_rel": 0.1,
+  "wrapping_edges_omitted": true,
+  "in_strength_cv_kernel": 1.5888710295164654e-16,
+  "in_strength_cv_rhizome": 0.32252160068530156,
+  "out_strength_cv_rhizome": 0.03831411945118675,
+  "gate_factor_log_variance": {
+    "total": 0.12462093240007635,
+    "receiver_only": 0.11664145963305445,
+    "sender_only": 0.0020774459900931666
+  },
+  "fan_receiver_factor": [
+    1.4873462602542162,
+    0.5488603644275327,
+    0.8294034867227995,
+    0.9406134625329753
+  ],
+  "fan_sender_factor_range": [
+    [
+      0.9496436515711173,
+      1.2073655837568542
+    ],
+    [
+      0.884430771103267,
+      1.2030374366551033
+    ],
+    [
+      0.9550209445910276,
+      1.196774112065756
+    ],
+    [
+      0.9572005895344571,
+      1.1988026653275619
+    ]
+  ],
+  "corr_in_strength_vs_receiver_gate": 0.9966427524217529,
+  "median_directed_asymmetry": 0.1742524131301985,
+  "receiver_gate_rms_range": [
+    0.5388986731312083,
+    1.4955714368362552
+  ],
+  "source_gate_rms_range": [
+    1.0404211924923452,
+    1.1228951416719692
+  ]
+}

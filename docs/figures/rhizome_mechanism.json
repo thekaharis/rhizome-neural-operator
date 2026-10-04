@@ -1,0 +1,39 @@
+{
+  "checkpoint": ".delta/worktrees/jav8yay7g827/ebm-21cm/runs/rhizome_long_seed1/fit/best.pt",
+  "checkpoint_step": 8200,
+  "split": "validation",
+  "row": 252,
+  "cone_id": 63,
+  "redshift": 10.554571502142819,
+  "true_mean_xhi": 0.501953125,
+  "receiver_yx": [
+    16,
+    16
+  ],
+  "mean_gate_gain_per_update": [
+    0.9467780815290618,
+    1.312742053059484,
+    1.5556943971568389,
+    1.671332092787685
+  ],
+  "reweighting_range_per_update": [
+    [
+      0.8823095148264297,
+      1.1304135772206592
+    ],
+    [
+      0.8439884580952631,
+      1.1631304424480464
+    ],
+    [
+      0.8404010077353906,
+      1.1960215816245976
+    ],
+    [
+      0.8336139941574169,
+      1.2091373152655127
+    ]
+  ],
+  "effective_shape_change_first_to_last": 0.041775511736077395,
+  "prediction_rmse": 0.0673713163891814
+}

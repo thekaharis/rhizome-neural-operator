@@ -153,6 +153,28 @@ class StructuredBrightness3d(nn.Module):
         tb = amplitude * xhi[:, 0].float() * (1 + delta) * spin * v_factor
         return ((tb - st["tb_offset"]) / st["tb_scale"])[:, None]
 
+    def physical_factor(self, x):
+        """A(z) (1 + delta) V in mK, (B, X, Y, Z): T_b for x_HI = 1 and S = 1.
+
+        The same arithmetic as ``forward`` (kept separate so the forward pass and
+        its exact match with fno-21cm stay untouched); the 2-D slice-wise head
+        multiplies this by its own x_HI and spin factor.
+        """
+        i, st = self.indices, self.stats
+        f = x.float()
+        delta = f[:, i["density"]] * st["density_scale"] + st["density_offset"]
+        velocity = f[:, i["velocity"]].double() * st["velocity_scale"] + st["velocity_offset"]
+        z = 1.0 / f[:, i["z"]] - 1.0
+        omm = f[:, i["omm"]] * st["omm_std"] + st["omm_mean"]
+        rel = f[0, i["relative"], 0, 0, :2]
+        cell = float(rel[1] - rel[0]) * 1000.0
+        h0 = 100.0 * self.HUBBLE_H / 3.0856775814913673e19
+        hubble = h0 * torch.sqrt(omm.double() * (1 + z.double()) ** 3 + 1 - omm.double())
+        ratio = (torch.gradient(velocity, spacing=cell, dim=-1)[0] / hubble).float()
+        v_factor = 1.0 / (1.0 + ratio.clamp(-self.MAX_DVDR, self.MAX_DVDR))
+        amplitude = 27.0 * (self.OMEGA_B_H2 / 0.023) * torch.sqrt(0.15 / (omm * self.HUBBLE_H ** 2) * (1 + z) / 10.0)
+        return amplitude * (1 + delta) * v_factor
+
 
 def ball_offsets(radius):
     """Integer offsets d with |d| <= radius, as an (n, 3) tensor (self included)."""
