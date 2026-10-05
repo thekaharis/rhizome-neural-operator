@@ -69,12 +69,17 @@ def band_means(values, centers, bands):
 
 def build(out, shard=0, n_shards=1, preparation=PREPARATION, fno_root=FNO_ROOT, history=HISTORY,
           slices_per_cone=48, background_slices=6, xhi_window=(0.02, 0.98), bands=DEFAULT_BANDS,
-          z_range=(5.001, 24.97), chunk=512, sample_seed=0, limit=None, clean_tb=False, log=print):
+          z_range=(5.001, 24.97), chunk=512, sample_seed=0, limit=None, clean_tb=False, wide_bands=(), log=print):
     """``clean_tb`` rebuilds T_b from raw (un-clipped) files with fno-21cm's
     ``tools_clean_brightness_temp.clean``, exactly as its cleaned mirror was made;
-    cones that still fail (non-finite or float16 overflow) are skipped and listed."""
+    cones that still fail (non-finite or float16 overflow) are skipped and listed.
+
+    ``wide_bands`` (e.g. out to +-128 cells) add extra LOS band means of density as
+    image channels and of both emulated histories as scalars, appended after the
+    standard ones; sampling then requires the wide bands to fit inside the cone."""
     bands = parse_bands(bands) if isinstance(bands, str) else [tuple(b) for b in bands]
-    below, above = band_extent(bands)
+    wide = parse_bands(wide_bands) if isinstance(wide_bands, str) else [tuple(b) for b in wide_bands]
+    below, above = band_extent(bands + wide)
     halo = max(below, above + 1)
     dataset, rows, LOSWindowConfig, head, structured, param_names = fno_dataset(preparation, fno_root, history)
     names = list(dataset.channel_names)
@@ -93,9 +98,9 @@ def build(out, shard=0, n_shards=1, preparation=PREPARATION, fno_root=FNO_ROOT, 
         def mk(name, shape, dt):
             return h.create_dataset(name, shape=(0, *shape), maxshape=(None, *shape), dtype=dt,
                                     chunks=(1, *shape) if len(shape) > 1 else (1024, *shape))
-        d = {"cond": mk("cond", (2 * len(bands), H, W), np.float16), "phys": mk("phys", (H, W), np.float32),
+        d = {"cond": mk("cond", (2 * len(bands) + len(wide), H, W), np.float16), "phys": mk("phys", (H, W), np.float32),
              "xhi": mk("xhi", (H, W), np.float16), "tb": mk("tb", (H, W), np.float16),
-             "scalars": mk("scalars", (1 + len(param_names) + 2 * len(bands),), np.float32),
+             "scalars": mk("scalars", (1 + len(param_names) + 2 * len(bands) + 2 * len(wide),), np.float32),
              "z": mk("z", (), np.float64), "los_index": mk("los_index", (), np.int32),
              "cone_id": mk("cone_id", (), np.int64), "split": mk("split", (), np.int8)}
         skipped = []
@@ -129,8 +134,11 @@ def build(out, shard=0, n_shards=1, preparation=PREPARATION, fno_root=FNO_ROOT, 
                         phys = head.physical_factor(x[None])[0].numpy()
                     x = x.numpy()
                     j = sel - start + halo
-                    parts["cond"].append(np.concatenate([band_means(x[0], j, bands), band_means(x[1], j, bands)], 1))
-                    hist = np.concatenate([band_means(x[-2, 0, 0], j, bands), band_means(x[-1, 0, 0], j, bands)], 1)
+                    parts["cond"].append(np.concatenate([band_means(x[0], j, bands), band_means(x[1], j, bands)]
+                                                        + ([band_means(x[0], j, wide)] if wide else []), 1))
+                    hist = np.concatenate([band_means(x[-2, 0, 0], j, bands), band_means(x[-1, 0, 0], j, bands)]
+                                          + ([band_means(x[-2, 0, 0], j, wide), band_means(x[-1, 0, 0], j, wide)]
+                                             if wide else []), 1)
                     parts["scalars"].append(np.concatenate([x[2, 0, 0, j][:, None], x[ip, 0, 0][:, j].T, hist], 1))
                     parts["phys"].append(np.moveaxis(phys[..., j], -1, 0))
                     parts["xhi"].append(np.moveaxis(y[0].numpy()[..., j], -1, 0))
@@ -154,9 +162,12 @@ def build(out, shard=0, n_shards=1, preparation=PREPARATION, fno_root=FNO_ROOT, 
             n_rows += n
             log(f"[{k + 1}/{len(mine)}] cone {cid}: {n} slices, split {split_of[row]}")
         h.attrs.update({"schema": SCHEMA, "bands": json.dumps(bands), "param_names": json.dumps(param_names),
-                        "cond_channels": json.dumps([f"density{b}" for b in bands] + [f"los_velocity{b}" for b in bands]),
+                        "cond_channels": json.dumps([f"density{b}" for b in bands] + [f"los_velocity{b}" for b in bands]
+                                                    + [f"density{b}" for b in wide]),
                         "scalar_names": json.dumps(["1/(1+z)", *param_names] + [f"x_HI_global{b}" for b in bands]
-                                                   + [f"T_b_global{b}" for b in bands]),
+                                                   + [f"T_b_global{b}" for b in bands] + [f"x_HI_global{b}" for b in wide]
+                                                   + [f"T_b_global{b}" for b in wide]),
+                        "wide_bands": json.dumps(wide),
                         "structured": json.dumps(structured), "normalization": json.dumps(dataset.normalization),
                         "preparation": str(preparation), "history": history, "slices_per_cone": slices_per_cone,
                         "background_slices": background_slices, "xhi_window": json.dumps(list(xhi_window)),
@@ -170,14 +181,14 @@ def build(out, shard=0, n_shards=1, preparation=PREPARATION, fno_root=FNO_ROOT, 
 def merge(shards, out, log=print):
     shards = sorted(Path(s) for s in shards)
     fixed = ("schema", "bands", "param_names", "cond_channels", "scalar_names", "structured", "normalization",
-             "preparation", "history", "slices_per_cone", "background_slices", "xhi_window", "z_range")
+             "preparation", "history", "slices_per_cone", "background_slices", "xhi_window", "z_range", "wide_bands")
     with h5py.File(shards[0], "r") as h0:
-        ref = {a: h0.attrs[a] for a in fixed}
+        ref = {a: h0.attrs[a] for a in fixed if a in h0.attrs}
         like = {k: (h0[k].shape[1:], h0[k].dtype, h0[k].chunks) for k in h0}
     total, seen = 0, set()
     for s in shards:
         with h5py.File(s, "r") as h:
-            if any(h.attrs[a] != ref[a] for a in fixed):
+            if any(h.attrs.get(a) != ref[a] for a in ref):
                 raise ValueError(f"{s}: attributes differ from {shards[0]}")
             ids = set(np.unique(h["cone_id"][:]).tolist())
             if ids & seen:
@@ -281,13 +292,15 @@ def main(argv=None):
     b.add_argument("--background-slices", type=int, default=6)
     b.add_argument("--limit", type=int, default=None)
     b.add_argument("--clean-tb", action="store_true", help="rebuild T_b from raw files (fno-21cm's cleaning)")
+    b.add_argument("--wide-bands", default="", help="extra wide LOS bands, e.g. -128:-96,-96:-64,-64:-32,32:64,64:96,96:128")
     m = sub.add_parser("merge")
     m.add_argument("--out", required=True)
     m.add_argument("shards", nargs="+")
     a = ap.parse_args(argv)
     if a.cmd == "build":
         build(a.out, a.shard, a.n_shards, a.preparation, a.fno_root, a.history, a.slices_per_cone,
-              a.background_slices, limit=a.limit, clean_tb=a.clean_tb, log=lambda s: print(s, flush=True))
+              a.background_slices, limit=a.limit, clean_tb=a.clean_tb, wide_bands=a.wide_bands or (),
+              log=lambda s: print(s, flush=True))
     else:
         merge(a.shards, a.out)
 

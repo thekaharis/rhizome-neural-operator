@@ -47,6 +47,7 @@ def main(argv=None):
     meta = json.loads((args.run / "metadata.json").read_text())
     attrs = meta["cache_attrs"]
     bands = [tuple(b) for b in json.loads(attrs["bands"])]
+    wide = [tuple(b) for b in json.loads(attrs.get("wide_bands", "[]"))]
     dataset, rows, LOSWindowConfig, head, _, param_names = fno_dataset(args.preparation, FNO_ROOT, attrs["history"])
     ip = [list(dataset.channel_names).index(p) for p in param_names]
     best = torch.load(args.run / "best.pt", map_location="cpu", weights_only=False)
@@ -73,7 +74,7 @@ def main(argv=None):
             ref_d = {key: d[key] for key in ("truth", "tb_truth", "density", "z_native")}
         z = np.asarray(dataset.redshifts[row])
         pick = np.abs(z[None, :] - ref_d["z_native"][:, None]).argmin(axis=1)
-        inp = slice_inputs(dataset, row, np.arange(len(z)), head, LOSWindowConfig, bands, ip)
+        inp = slice_inputs(dataset, row, np.arange(len(z)), head, LOSWindowConfig, bands, ip, wide=wide)
         n = len(z)
         x = np.empty((n, *inp["cond"].shape[-2:]), np.float32)
         u = np.empty_like(x)
