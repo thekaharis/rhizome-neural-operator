@@ -132,6 +132,10 @@ def main(argv=None):
     ap.add_argument("--max-cones", type=int, default=None)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--cpu-inputs", action="store_true", help="build the inputs on the CPU (slower; the reference path)")
+    ap.add_argument("--native-cyl", default=None, metavar="PREFIX",
+                    help="also write native-resolution cylindrical x_HI/T_b power (ebm21cm.native_cyl) to PREFIX_<field>.npz")
+    ap.add_argument("--cyl-z", type=float, nargs="+", default=[7.0, 9.0, 11.0, 14.0, 17.0])
+    ap.add_argument("--cyl-only", action="store_true", help="only the native cylindrical power, no cubes")
     args = ap.parse_args(argv)
 
     meta = json.loads((args.run / "metadata.json").read_text())
@@ -147,6 +151,8 @@ def main(argv=None):
     model = RhizomeOperator2d(**best["model_config"]).to(device).eval()
     model.load_state_dict(best["model"])
     tb_off, tb_scale = best["tb_norm"]
+    keep = best.get("scalar_keep")  # history-ablation models see a subset of the scalars
+    keep_t = None if keep is None else torch.as_tensor(keep, device=device)
     # Sample ids come from the file names (mirror row != sample id after row 72), as in export_cubes3d.
     row_of = {int(re.findall(r"\d+", Path(dataset.file_paths[r]).stem)[-1]): int(r) for r in rows["test"]}
 
@@ -157,7 +163,8 @@ def main(argv=None):
         with torch.no_grad():
             for a in range(0, n, args.batch_size):
                 b = slice(a, a + args.batch_size)
-                out = model(torch.as_tensor(inp["cond"][b]).to(device), torch.as_tensor(inp["scalars"][b]).to(device))
+                scal = inp["scalars"][b] if keep is None else inp["scalars"][b][:, keep]
+                out = model(torch.as_tensor(inp["cond"][b]).to(device), torch.as_tensor(scal).to(device))
                 t = tb_normalized(out, torch.as_tensor(inp["phys"][b][:, None]).to(device), best["head"], tb_off, tb_scale)
                 xhi[b] = out[:, 0].sigmoid().float().cpu().numpy()
                 tb[b] = (t[:, 0] * tb_scale + tb_off).float().cpu().numpy()
@@ -177,7 +184,7 @@ def main(argv=None):
                                            targets=True):
                 for a in range(0, len(g["cond"]), args.batch_size):
                     b = slice(a, a + args.batch_size)
-                    o = model(g["cond"][b], g["scalars"][b])
+                    o = model(g["cond"][b], g["scalars"][b] if keep_t is None else g["scalars"][b][:, keep_t])
                     t = tb_normalized(o, g["phys"][b][:, None], best["head"], tb_off, tb_scale)
                     xs.append(o[:, 0].sigmoid().float())
                     ts.append((t[:, 0] * tb_scale + tb_off).float())
@@ -218,11 +225,23 @@ def main(argv=None):
     (ref_tag, entries), = ref["models"].items()
     entries = entries[:args.max_cones]
     written = []
+    cyl = None
+    if args.native_cyl:
+        from .native_cyl import NativeCyl
+        cyl = NativeCyl(args.cyl_z)
     for k, entry in enumerate(entries):
         sid = int(entry["cone_id"])
         row = int(entry["row"])
         if row_of.get(sid) != row:
             raise ValueError(f"cone {sid}: reference row {row} is not this sample's test row")
+        if cyl is not None:
+            zn = np.asarray(dataset.redshifts[row])
+            c_xhi, c_tb, c_txhi, c_ttb = run(row, cyl.needed(zn))
+            cyl.add("xhi", sid, zn, np.moveaxis(c_txhi, 0, -1), c_xhi)
+            cyl.add("tb", sid, zn, np.moveaxis(c_ttb, 0, -1) * tb_scale + tb_off, c_tb)
+            if args.cyl_only:
+                print(f"[{k + 1}/{len(entries)}] sample {sid}: native cylindrical power", flush=True)
+                continue
         with np.load(entry["npz"]) as d:
             ref_d = {key: d[key] for key in ("truth", "tb_truth", "density", "z_native")}
         z = np.asarray(dataset.redshifts[row])
@@ -246,6 +265,10 @@ def main(argv=None):
         written.append({**entry, "npz": str(target.resolve())})
         print(f"[{k + 1}/{len(entries)}] sample {sid}: x_HI rmse {np.sqrt(np.mean((xhi - ref_d['truth']) ** 2)):.4f} "
               f"T_b rmse {np.sqrt(np.mean((tb - ref_d['tb_truth']) ** 2)):.2f} mK", flush=True)
+    if cyl is not None:
+        print("wrote", *cyl.save(args.native_cyl, args.tag), flush=True)
+        if args.cyl_only:
+            return
     manifest = {"z_grid": ref["z_grid"], "models": {args.tag: written},
                 "checkpoint": str((args.run / "best.pt").resolve()), "epoch": best.get("step"), "split": ref.get("split"),
                 "selection": f"slice-wise 2-D prediction at the slices of {ref_tag}", "fields": ref.get("fields", {})}

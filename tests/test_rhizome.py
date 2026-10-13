@@ -3,7 +3,7 @@ import torch
 from torch import nn
 
 from ebm21cm.model.recurrent import SpectralConv2d
-from ebm21cm.model.rhizome import RhizomeOperator2d, StateDependentIntegral2d
+from ebm21cm.model.rhizome import LocalConv2d, RhizomeOperator2d, StateDependentIntegral2d, disc_offsets
 
 
 def _dense_quadrature(interaction, state, forcing):
@@ -159,3 +159,90 @@ def test_integral_input_validation():
         model(torch.zeros(1, 1, 8, 8))
     with pytest.raises(ValueError, match="2\\*modes"):
         model(torch.zeros(1, 1, 3, 8), torch.zeros(1, 2))
+
+
+@pytest.mark.parametrize("radius,count", [(1, 5), (2 ** 0.5, 9), (2, 13), (5 ** 0.5, 21), (3, 29), (4, 49)])
+def test_disc_offsets_count_lattice_points(radius, count):
+    assert len(disc_offsets(radius)) == count
+
+
+def test_local_kernel_single_offset_is_periodic_shift():
+    conv = LocalConv2d(1, 2.5).double()
+    with torch.no_grad():
+        conv.weight.zero_()
+        conv.weight[0, 0, disc_offsets(2.5).tolist().index([1, -2])] = 1
+    x = torch.randn(1, 1, 7, 9, dtype=torch.float64)
+    # Cross-correlation on the torus: y(r) = x(r + d).
+    assert torch.allclose(conv(x), torch.roll(x, (-1, 2), dims=(2, 3)))
+
+
+@pytest.mark.parametrize("rank", [None, 3])
+def test_local_model_influence_stays_inside_steps_times_radius(rank):
+    torch.manual_seed(0)
+    model = RhizomeOperator2d(4, width=6, modes=2, n_steps=2, radius=1.5, rank=rank).double().eval()
+    x = torch.randn(1, 4, 12, 13, dtype=torch.float64)
+    bumped = x.clone()
+    bumped[0, :, 0, 5] += 1.0
+    changed = (model(bumped) - model(x)).abs()[0, 0] > 0
+    i, j = torch.meshgrid(torch.arange(12), torch.arange(13), indexing="ij")
+    di, dj = torch.minimum(i, 12 - i), torch.minimum((j - 5).abs(), 13 - (j - 5).abs())
+    dist = (di.square() + dj.square()).double().sqrt()
+    assert changed[dist <= 1.5].all() and not changed[dist > 2 * 1.5 + 1e-9].any()
+    assert changed[dist > 1.5].any()  # the second update does extend the reach
+    model(x).square().mean().backward()
+    assert all(q.grad is not None and torch.isfinite(q.grad).all() for q in model.parameters())
+
+
+def test_local_model_commutes_with_periodic_rolls():
+    torch.manual_seed(0)
+    model = RhizomeOperator2d(4, width=6, modes=2, n_steps=2, radius=2).double().eval()
+    x = torch.randn(1, 4, 9, 10, dtype=torch.float64)
+    assert torch.allclose(model(torch.roll(x, (3, 5), dims=(2, 3))), torch.roll(model(x), (3, 5), dims=(2, 3)))
+
+
+def test_local_kernel_matches_dense_integral():
+    torch.manual_seed(0)
+    conv = LocalConv2d(3, 2).double()
+    x = torch.randn(2, 3, 6, 7, dtype=torch.float64)
+    expected = torch.zeros_like(x)
+    for (dy, dx), w in zip(disc_offsets(2).tolist(), conv.weight.unbind(-1)):
+        expected += torch.einsum("oi,bihw->bohw", w, torch.roll(x, (-dy, -dx), dims=(2, 3)))
+    assert torch.allclose(conv(x), expected)
+
+
+def test_native_cyl_matches_fno_cylindrical_sums_and_identity():
+    import sys
+
+    import numpy as np
+
+    from ebm21cm.native_cyl import FNO_ROOT, NativeCyl
+    sys.path.insert(0, FNO_ROOT)
+    from viz.power_spectrum_evaluation import PowerSpectrumAccumulator, SpectrumConfig, ZChunk
+
+    rng = np.random.default_rng(0)
+    nc = NativeCyl([10.0], n_cells=16, kpar_bins="log")
+    truth, pred = rng.normal(size=(140, 140, 16)), rng.normal(size=(140, 140, 16))
+    # fno-21cm's own chunk sums, then the k_par log binning applied to them.
+    k = 2 * np.pi * np.fft.rfftfreq(16, d=200 / 140)
+    chunk = ZChunk(10.0, 0, 16, 200 / 140, k[1:], np.concatenate([[k[1] / 2], k[1:] + k[1] / 2]), np.hanning(16))
+    acc = PowerSpectrumAccumulator(SpectrumConfig(), nc.binner, chunks=[chunk])
+    ref = [x.T @ nc.kpar_matrix[1:] for x in acc._cylindrical_sums(truth, pred, chunk)]
+    ours = nc._sums(truth, pred)
+    assert all(np.allclose(a.T, b) for a, b in zip(ref, ours))
+    # A perfect prediction on a whole cone: ratio and coherence are exactly 1.
+    z, field = np.linspace(9, 11, 40), rng.normal(size=(140, 140, 40))
+    nc.add("xhi", 1, z, field, field)
+    pt, pp, cross, ok = nc.records["xhi"][0][0]
+    assert ok and np.allclose(pp, pt) and np.allclose(cross, pt)
+
+
+def test_native_cyl_linear_kpar_rows_are_the_los_frequencies():
+    import numpy as np
+
+    from ebm21cm.native_cyl import NativeCyl
+
+    nc = NativeCyl([10.0], n_cells=16)
+    k = 2 * np.pi * np.fft.rfftfreq(16, d=200 / 140)
+    assert nc.kpar_matrix.shape == (9, 8) and np.allclose(0.5 * (nc.kpar_edges[1:] + nc.kpar_edges[:-1]), k[1:])
+    pt, pp, cross = nc._sums(*np.random.default_rng(1).normal(size=(2, 140, 140, 16)))
+    assert pt.shape == (8, 15) and np.all(pt > 0)

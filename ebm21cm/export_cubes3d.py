@@ -78,6 +78,10 @@ def main(argv=None):
     ap.add_argument("--max-cones", type=int, default=None)
     ap.add_argument("--h5-cones", type=int, nargs="*", default=[], help="sample ids to also write at native resolution")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--native-cyl", default=None, metavar="PREFIX",
+                    help="also write native-resolution cylindrical x_HI/T_b power (ebm21cm.native_cyl) to PREFIX_<field>.npz")
+    ap.add_argument("--cyl-z", type=float, nargs="+", default=[7.0, 9.0, 11.0, 14.0, 17.0])
+    ap.add_argument("--cyl-only", action="store_true", help="only the native cylindrical power, no cubes")
     args = ap.parse_args(argv)
 
     device = torch.device(args.device)
@@ -95,6 +99,10 @@ def main(argv=None):
     out = args.out_dir / args.tag
     (out / "native").mkdir(parents=True, exist_ok=True)
     entries = []
+    cyl = None
+    if args.native_cyl:
+        from .native_cyl import NativeCyl
+        cyl = NativeCyl(args.cyl_z, fields=("xhi", "tb") if has_tb else ("xhi",))
     split_rows = list(rows[args.split])[:args.max_cones]
     for k, row in enumerate(split_rows):
         path = Path(dataset.file_paths[row])
@@ -108,6 +116,13 @@ def main(argv=None):
         both = predict_native_cone(model, dataset, row, window, device).numpy()
         pred = both[0] * norm["scale"] + norm["offset"]
         truth = dataset.read_fields(row, names=["neutral_fraction", "density"] + (["brightness_temp"] if has_tb else []))
+        if cyl is not None:
+            cyl.add("xhi", sid, z, truth["neutral_fraction"], pred)
+            if has_tb:
+                cyl.add("tb", sid, z, truth["brightness_temp"], both[1] * tb_norm["scale"] + tb_norm["offset"])
+            if args.cyl_only:
+                print(f"[{k + 1}/{len(split_rows)}] sample {sid}: native cylindrical power", flush=True)
+                continue
         target = f"cone_{sid:06d}.npz"
         extra = {}
         if has_tb:  # same keys as fno-21cm's multi-field cubes (mK)
@@ -143,6 +158,10 @@ def main(argv=None):
                                 "sampling": json.dumps(window.to_dict())})
         print(f"[{k + 1}/{len(split_rows)}] sample {sid} (row {row}) "
               f"rmse {np.sqrt(np.mean((pred - truth['neutral_fraction']) ** 2)):.4f}", flush=True)
+    if cyl is not None:
+        print("wrote", *cyl.save(args.native_cyl, args.tag), flush=True)
+        if args.cyl_only:
+            return
     manifest = {"z_grid": z_grid.tolist(), "models": {args.tag: entries}, **description,
                 "split": args.split, "selection": "nearest native slice per grid redshift",
                 "fields": {"pred/truth": "neutral_fraction", "density": "overdensity (input)",

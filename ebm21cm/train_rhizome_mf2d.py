@@ -46,9 +46,16 @@ class MFConfig(LongRunConfig):
     # Mpc^-1, power_bins log-spaced bins to the grid Nyquist) of
     # (log(P_pred + eps) - log(P_true + eps))^2 on mean-subtracted normalized T_b.
     power_weight: float = 0.0
+    xhi_power_weight: float = 0.0  # the same term on the x_HI probability (sigmoid output)
     power_kmin: float = 0.3
     power_bins: int = 8
     power_eps: float = 1e-6
+    # Compact real-space kernel of this radius in cells instead of the Fourier one (0 = spectral, --modes used).
+    radius: float = 0.0
+    rank: int = 0  # factorized compact kernel (0 = dense C x C per offset)
+    # Ablation: drop the emulated global-history band means of x_HI ("xhi"), T_b ("tb") or both ("both")
+    # from the scalars; the kept column indices are saved with the checkpoint for the exporter.
+    drop_history: str = ""
 
 
 class PowerLoss(torch.nn.Module):
@@ -78,6 +85,21 @@ class PowerLoss(torch.nn.Module):
         return self.per_slice(pred, true).mean()
 
 
+HISTORY_PREFIX = {"xhi": ("x_HI_global",), "tb": ("T_b_global",), "both": ("x_HI_global", "T_b_global")}
+
+
+def scalar_keep(names, drop):
+    """Indices of the scalars kept after dropping the history band means named by ``drop``."""
+    if not drop:
+        return list(range(len(names)))
+    if drop not in HISTORY_PREFIX:
+        raise ValueError(f"drop_history must be one of {sorted(HISTORY_PREFIX)}")
+    keep = [i for i, n in enumerate(names) if not n.startswith(HISTORY_PREFIX[drop])]
+    if len(keep) == len(names):
+        raise ValueError(f"no {drop} history scalars in the cache")
+    return keep
+
+
 def tb_normalized(out, phys, head, tb_offset, tb_scale):
     """Normalized T_b from the network output (B, 2, H, W)."""
     if head == "plain":
@@ -89,7 +111,7 @@ def tb_normalized(out, phys, head, tb_offset, tb_scale):
 @torch.no_grad()
 def evaluate(model, loader, device, head, tb_norm, collect=False, power=None):
     model.eval()
-    sums = {"bce": 0.0, "x_se": 0.0, "t_se": 0.0, "n": 0, "p_sum": 0.0, "p_n": 0}
+    sums = {"bce": 0.0, "x_se": 0.0, "t_se": 0.0, "n": 0, "p_sum": 0.0, "p_n": 0, "px_sum": 0.0}
     kept = {"x_pred": [], "x_true": [], "t_pred": [], "t_true": [], "z": [], "cone_id": []}
     for batch in loader:
         out = model(batch["cond"], batch["scalars"])
@@ -101,6 +123,7 @@ def evaluate(model, loader, device, head, tb_norm, collect=False, power=None):
         sums["n"] += y[:, :1].numel()
         if power is not None:
             sums["p_sum"] += float(power.per_slice(t, y[:, 1:]).sum())
+            sums["px_sum"] += float(power.per_slice(x, y[:, :1]).sum())
             sums["p_n"] += len(t)
         if collect:
             for k, v in (("x_pred", x), ("x_true", y[:, :1]), ("t_pred", t), ("t_true", y[:, 1:])):
@@ -113,6 +136,7 @@ def evaluate(model, loader, device, head, tb_norm, collect=False, power=None):
               "xhi_nmse": x_mse, "tb_nmse": t_nmse, "score": 0.5 * (x_mse + t_nmse)}
     if power is not None:
         scores["tb_power_logerr"] = sums["p_sum"] / max(sums["p_n"], 1)
+        scores["xhi_power_logerr"] = sums["px_sum"] / max(sums["p_n"], 1)
     return (scores, {k: np.concatenate(v) for k, v in kept.items()}) if collect else scores
 
 
@@ -134,12 +158,21 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
           f"{time.perf_counter() - t0:.0f} s", flush=True)
     norm = json.loads(train.attrs["normalization"])["brightness_temp"]
     tb_norm = (float(norm["offset"]), float(norm["scale"]))
+    keep = scalar_keep(json.loads(train.attrs["scalar_names"]), config.drop_history)
+    if config.drop_history:
+        for split in (train, val):
+            split.scalars = split.scalars[:, keep]
+        print(f"drop_history={config.drop_history}: {len(keep)} of {len(json.loads(train.attrs['scalar_names']))} "
+              f"scalars kept", flush=True)
     eval_batch = config.eval_batch_size or config.batch_size
     stream = MemoryStream(train, config.batch_size, config.seed)
     val_loader = val.loader(eval_batch)
     model_config = {"in_channels": train.cond.shape[1], "out_channels": 2, "scalar_dim": train.scalars.shape[1],
                     "width": config.width, "modes": config.modes, "n_steps": config.updates,
                     "step_size": config.step_size}
+    if config.radius:
+        model_config.update(radius=config.radius, rank=config.rank or None)
+        torch.backends.cudnn.benchmark = True  # cuDNN's default algorithm choice is erratic for wide stencils
     model = RhizomeOperator2d(**model_config).to(device)
     power = PowerLoss(*train.cond.shape[-2:], config.power_kmin, config.power_bins, config.power_eps).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
@@ -171,7 +204,7 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
         (run_dir / "metadata.json").write_text(json.dumps({
             **signature, "model_config": model_config, "cache": str(Path(cache_path).resolve()),
             "cache_attrs": {k: (v.item() if hasattr(v, "item") else v) for k, v in train.attrs.items()},
-            "tb_normalization": tb_norm, "git_commit": git_commit(root),
+            "tb_normalization": tb_norm, "git_commit": git_commit(root), "scalar_keep": keep,
             "rows": {"train": len(train), "val": len(val)},
             "objective": "BCE(x_HI) + tb_weight * MSE(normalized T_b); selection: mean normalized MSE",
             "initial_max_steps": config.max_steps}, indent=2))
@@ -184,7 +217,8 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
                       "step": step, "samples_seen": samples, "elapsed_seconds": saved, "plateau": asdict(plateau),
                       "best_model": best_model, "history": history, "stopped": stopped}, run_dir / "last.pt")
         _atomic_save({"model": best_model, "model_config": model_config, "head": config.head, "tb_norm": tb_norm,
-                      "step": plateau.best_step, "validation_score": plateau.best}, run_dir / "best.pt")
+                      "step": plateau.best_step, "validation_score": plateau.best,
+                      **({"scalar_keep": keep} if config.drop_history else {})}, run_dir / "best.pt")
         (run_dir / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in history))
         return saved
 
@@ -199,6 +233,8 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
         loss = F.binary_cross_entropy_with_logits(out[:, :1], y[:, :1]) + config.tb_weight * F.mse_loss(t, y[:, 1:])
         if config.power_weight:
             loss = loss + config.power_weight * power(t, y[:, 1:])
+        if config.xhi_power_weight:
+            loss = loss + config.xhi_power_weight * power(out[:, :1].sigmoid(), y[:, :1])
         if not torch.isfinite(loss):
             raise FloatingPointError(f"non-finite training loss at step {step + 1}")
         loss.backward()
@@ -224,7 +260,7 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
             window_loss, window_n = 0.0, 0
             save()
             print(f"step {step:6d} epochs {samples / len(train):5.1f} loss {history[-1]['train_loss']:.5f} "
-                  f"val x_HI {scores['xhi_rmse']:.5f} T_b {scores['tb_rmse_mk']:.3f} mK P_err {scores.get('tb_power_logerr', 0):.4f} "
+                  f"val x_HI {scores['xhi_rmse']:.5f} T_b {scores['tb_rmse_mk']:.3f} mK P_err {scores.get('tb_power_logerr', 0):.4f} Px_err {scores.get('xhi_power_logerr', 0):.4f} "
                   f"score {scores['score']:.6f} "
                   f"best {plateau.best:.6f} lr {lr:.2g}->{next_lr:.2g} plateau {plateau.bad_checks}/{config.stop_patience}",
                   flush=True)
@@ -235,6 +271,7 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
     if stopped:
         model.load_state_dict(best_model)
         test = MFMemorySplit(cache_path, "test", storage, device)
+        test.scalars = test.scalars[:, keep]
         scores, kept = evaluate(model, test.loader(eval_batch), device, config.head, tb_norm, collect=True, power=power)
         result["test"] = scores
         np.savez_compressed(run_dir / "test_predictions.npz", **kept)
