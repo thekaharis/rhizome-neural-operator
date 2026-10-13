@@ -77,6 +77,9 @@ class LocalConv2d(nn.Module):
         return F.conv2d(x, self.proj_out.to(x.dtype))
 
 
+GATE_MODES = ("full", "frozen", "none", "source", "receiver", "static")
+
+
 class StateDependentIntegral2d(nn.Module):
     """Factorized kernel K_ij = diag(A_i) kappa(r_i-r_j) diag(B_j).
 
@@ -84,12 +87,24 @@ class StateDependentIntegral2d(nn.Module):
     kappa mixes channels and may be signed/asymmetric; this is neither a
     probability attention matrix nor a guaranteed reciprocal interaction.
     The factorization avoids materializing a quadratic all-pairs edge tensor.
+
+    ``gate_mode`` (ablations; the transmitted value V always uses the current state):
+    ``full`` gates from [h^t, c] at every update; ``frozen`` gates from the initial
+    state [h^0, c] = [tanh(c), c], i.e. computed once and held over the rollout;
+    ``none`` A = B = 1; ``source`` / ``receiver`` only that gate (state-dependent),
+    the other fixed at 1; ``static`` learned per-channel constants.
     """
 
-    def __init__(self, width, modes, radius=None, rank=None):
+    def __init__(self, width, modes, radius=None, rank=None, gate_mode="full"):
         super().__init__()
         self.width = _integer("width", width)
-        self.gates = nn.Conv2d(2 * width, 2 * width, 1)
+        if gate_mode not in GATE_MODES:
+            raise ValueError(f"gate_mode must be one of {GATE_MODES}")
+        self.gate_mode = gate_mode
+        if gate_mode in ("full", "frozen", "source", "receiver"):
+            self.gates = nn.Conv2d(2 * width, 2 * width, 1)
+        elif gate_mode == "static":
+            self.static_logits = nn.Parameter(torch.zeros(2 * width))
         self.value = nn.Conv2d(2 * width, width, 1, bias=False)
         self.kernel = SpectralConv2d(width, width, modes) if radius is None else LocalConv2d(width, radius, rank)
 
@@ -98,7 +113,19 @@ class StateDependentIntegral2d(nn.Module):
         if state.ndim != 4 or state.shape != forcing.shape or state.shape[1] != self.width:
             raise ValueError(f"state and forcing must have matching (B,{self.width},H,W) shapes")
         context = torch.cat([state, forcing], dim=1)
-        source, receiver = (2 * self.gates(context).sigmoid()).chunk(2, dim=1)
+        mode = self.gate_mode
+        if mode == "none":
+            source = receiver = torch.ones_like(state)
+        elif mode == "static":
+            source, receiver = (2 * self.static_logits.sigmoid()).view(1, -1, 1, 1).expand(
+                state.shape[0], -1, *state.shape[-2:]).chunk(2, dim=1)
+        else:
+            gate_input = torch.cat([forcing.tanh(), forcing], dim=1) if mode == "frozen" else context
+            source, receiver = (2 * self.gates(gate_input).sigmoid()).chunk(2, dim=1)
+            if mode == "source":
+                receiver = torch.ones_like(receiver)
+            elif mode == "receiver":
+                source = torch.ones_like(source)
         return source, receiver, self.value(context)
 
     def forward(self, state, forcing):
@@ -111,10 +138,10 @@ class StateDependentIntegral2d(nn.Module):
 class IntegralUpdate(nn.Module):
     """One shared interaction law followed by a strictly pointwise state update."""
 
-    def __init__(self, width, modes, step_size, radius=None, rank=None):
+    def __init__(self, width, modes, step_size, radius=None, rank=None, gate_mode="full"):
         super().__init__()
         self.step_size = step_size
-        self.interaction = StateDependentIntegral2d(width, modes, radius, rank)
+        self.interaction = StateDependentIntegral2d(width, modes, radius, rank, gate_mode)
         self.proposal = nn.Conv2d(3 * width, width, 1)
 
     def forward(self, state, forcing):
@@ -141,11 +168,102 @@ class RhizomeOperator2d(_RecurrentField2d):
     stencils are used. This supports consistent quadrature, not a guarantee of
     resolution-transfer accuracy, convergence, or stochastic generation.
     ``radius`` (cells) swaps in the compact real-space kernel; ``modes`` is then unused.
+    ``gate_mode`` selects a gate ablation (see StateDependentIntegral2d); "frozen"
+    relies on the initial state being tanh(forcing), as here.
     """
 
     def __init__(self, in_channels, out_channels=1, scalar_dim=0, width=24, modes=6,
-                 n_steps=6, step_size=0.5, untied=False, radius=None, rank=None):
+                 n_steps=6, step_size=0.5, untied=False, radius=None, rank=None, gate_mode="full"):
         super().__init__(
             in_channels, out_channels, scalar_dim, width, modes, n_steps, step_size, untied,
-            partial(IntegralUpdate, radius=radius, rank=rank),
+            partial(IntegralUpdate, radius=radius, rank=rank, gate_mode=gate_mode),
         )
+
+
+def periodic_upsample(x, factor):
+    """Bilinear upsampling by an integer factor on a periodic grid (cell-centred, wraps at the edges)."""
+    x = F.pad(x, (1, 1, 1, 1), mode="circular")
+    x = F.interpolate(x, scale_factor=factor, mode="bilinear", align_corners=False)
+    return x[..., factor:-factor, factor:-factor]
+
+
+class RhizomeUNet2d(nn.Module):
+    """Two-level rhizome: a coarse rollout for long-range context, then a full-resolution rollout.
+
+    The conditioning is average-pooled by ``factor`` (cells stay aligned with the
+    fine grid, so rolls by multiples of ``factor`` commute with the model), lifted
+    and rolled out for ``coarse_steps`` tied updates with its own interaction law
+    (spectral with ``coarse_modes``, or compact with ``coarse_radius`` cells of the
+    coarse grid). The coarse state is upsampled (periodic bilinear) and merged
+    pointwise into the fine forcing, which drives ``n_steps`` tied fine updates
+    (``modes`` or ``radius``, as in RhizomeOperator2d). Decoded from the fine
+    state. One down/up level, no other skip paths.
+    """
+
+    def __init__(self, in_channels, out_channels=1, scalar_dim=0, width=24, modes=6, n_steps=3, step_size=0.5,
+                 radius=None, rank=None, factor=4, coarse_modes=4, coarse_steps=3, coarse_radius=None,
+                 coarse_rank=None):
+        super().__init__()
+        self.in_channels = _integer("in_channels", in_channels)
+        self.out_channels = _integer("out_channels", out_channels)
+        self.scalar_dim = _integer("scalar_dim", scalar_dim, minimum=0)
+        self.width = _integer("width", width)
+        self.n_steps = _integer("n_steps", n_steps)
+        self.coarse_steps = _integer("coarse_steps", coarse_steps)
+        self.factor = _integer("factor", factor, minimum=2)
+        if isinstance(step_size, bool) or not 0 < step_size <= 1:
+            raise ValueError("step_size must be in (0, 1]")
+        self.lift_coarse = nn.Conv2d(in_channels, width, 1)
+        self.lift_fine = nn.Conv2d(in_channels, width, 1)
+        self.scalar_coarse = nn.Linear(scalar_dim, width) if scalar_dim else None
+        self.scalar_fine = nn.Linear(scalar_dim, width) if scalar_dim else None
+        self.coarse = IntegralUpdate(width, coarse_modes, float(step_size), coarse_radius, coarse_rank)
+        self.fine = IntegralUpdate(width, modes, float(step_size), radius, rank)
+        self.merge = nn.Conv2d(2 * width, width, 1)
+        self.decode = nn.Sequential(nn.Conv2d(width, width, 1), nn.GELU(), nn.Conv2d(width, out_channels, 1))
+
+    @staticmethod
+    def _forcing(lift, embed, cond, scalars):
+        forcing = lift(cond)
+        return forcing if embed is None else forcing + embed(scalars)[:, :, None, None]
+
+    def forward(self, cond, scalars=None, *, return_states=False):
+        if cond.ndim != 4 or cond.shape[1] != self.in_channels or min(cond.shape) < 1:
+            raise ValueError(f"expected nonempty (B,{self.in_channels},H,W) conditioning")
+        if cond.dtype not in (torch.float32, torch.float64):
+            raise ValueError("conditioning must use float32 or float64")
+        h, w = cond.shape[-2:]
+        if h % self.factor or w % self.factor:
+            raise ValueError(f"grid {(h, w)} is not divisible by factor {self.factor}")
+        if (scalars is None) != (self.scalar_dim == 0) or (
+                scalars is not None and scalars.shape != (cond.shape[0], self.scalar_dim)):
+            raise ValueError(f"expected scalars with shape {(cond.shape[0], self.scalar_dim)}")
+        forcing_c = self._forcing(self.lift_coarse, self.scalar_coarse, F.avg_pool2d(cond, self.factor), scalars)
+        coarse = forcing_c.tanh()
+        states = [coarse] if return_states else None
+        for _ in range(self.coarse_steps):
+            coarse = self.coarse(coarse, forcing_c)
+            if return_states:
+                states.append(coarse)
+        forcing_f = self.merge(torch.cat([self._forcing(self.lift_fine, self.scalar_fine, cond, scalars),
+                                          periodic_upsample(coarse, self.factor)], dim=1))
+        state = forcing_f.tanh()
+        if return_states:
+            states.append(state)
+        for _ in range(self.n_steps):
+            state = self.fine(state, forcing_f)
+            if return_states:
+                states.append(state)
+        output = self.decode(state)
+        return (output, states) if return_states else output
+
+
+def build_model(config):
+    """RhizomeOperator2d, or RhizomeUNet2d for ``config["kind"] == "unet"``, from a saved model config."""
+    config = dict(config)
+    kind = config.pop("kind", "rhizome")
+    if kind == "unet":
+        return RhizomeUNet2d(**config)
+    if kind == "rhizome":
+        return RhizomeOperator2d(**config)
+    raise ValueError(f"unknown model kind {kind!r}")

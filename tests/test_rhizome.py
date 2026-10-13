@@ -246,3 +246,61 @@ def test_native_cyl_linear_kpar_rows_are_the_los_frequencies():
     assert nc.kpar_matrix.shape == (9, 8) and np.allclose(0.5 * (nc.kpar_edges[1:] + nc.kpar_edges[:-1]), k[1:])
     pt, pp, cross = nc._sums(*np.random.default_rng(1).normal(size=(2, 140, 140, 16)))
     assert pt.shape == (8, 15) and np.all(pt > 0)
+
+
+def test_periodic_upsample_is_exact_for_constants_and_wraps():
+    from ebm21cm.model.rhizome import periodic_upsample
+
+    x = torch.randn(1, 2, 5, 7, dtype=torch.float64)
+    assert torch.allclose(periodic_upsample(torch.ones(1, 1, 5, 7), 4), torch.ones(1, 1, 20, 28))
+    up = periodic_upsample(x, 4)
+    assert up.shape == (1, 2, 20, 28)
+    # A roll of the coarse grid is a roll by factor cells of the fine grid.
+    assert torch.allclose(periodic_upsample(torch.roll(x, (1, 2), (2, 3)), 4), torch.roll(up, (4, 8), (2, 3)))
+
+
+@pytest.mark.parametrize("fine_radius,coarse_radius", [(None, None), (None, 2), (1.5, None), (1.5, 2)])
+def test_unet_shapes_roll_equivariance_and_gradients(fine_radius, coarse_radius):
+    from ebm21cm.model.rhizome import RhizomeUNet2d, build_model
+
+    torch.manual_seed(0)
+    cfg = dict(in_channels=3, out_channels=2, scalar_dim=4, width=6, modes=3, n_steps=2, radius=fine_radius,
+               factor=4, coarse_modes=2, coarse_steps=2, coarse_radius=coarse_radius)
+    model = build_model({"kind": "unet", **cfg}).double().eval()
+    assert isinstance(model, RhizomeUNet2d)
+    cond, scal = torch.randn(2, 3, 24, 20, dtype=torch.float64), torch.randn(2, 4, dtype=torch.float64)
+    out = model(cond, scal)
+    assert out.shape == (2, 2, 24, 20)
+    rolled = model(torch.roll(cond, (8, 4), (2, 3)), scal)
+    assert torch.allclose(rolled, torch.roll(out, (8, 4), (2, 3)))
+    model.train()
+    model(cond, scal).square().mean().backward()
+    assert all(q.grad is not None and torch.isfinite(q.grad).all() for q in model.parameters())
+    with pytest.raises(ValueError):
+        model(torch.randn(1, 3, 22, 20, dtype=torch.float64), scal[:1])
+
+
+@pytest.mark.parametrize("mode", ["full", "frozen", "none", "source", "receiver", "static"])
+def test_gate_modes(mode):
+    torch.manual_seed(0)
+    model = RhizomeOperator2d(3, 2, 4, width=6, modes=3, n_steps=3, gate_mode=mode).double()
+    cond, scal = torch.randn(2, 3, 12, 10, dtype=torch.float64), torch.randn(2, 4, dtype=torch.float64)
+    with torch.no_grad():
+        _, states = model(cond, scal, return_states=True)
+        forcing = model.lift(cond) + model.scalar_embed(scal)[:, :, None, None]
+        inter = model.cells[0].interaction
+        gates = [inter.factors(s, forcing)[:2] for s in states[:-1]]
+    first_src, first_rcv = gates[0]
+    for src, rcv in gates:
+        assert ((src > 0) & (src < 2)).all() and ((rcv > 0) & (rcv < 2)).all()
+        if mode in ("frozen", "none", "static"):  # independent of the evolving state
+            assert torch.allclose(src, first_src) and torch.allclose(rcv, first_rcv)
+        if mode in ("none", "receiver"):
+            assert torch.equal(src, torch.ones_like(src))
+        if mode in ("none", "source"):
+            assert torch.equal(rcv, torch.ones_like(rcv))
+    if mode in ("full", "source", "receiver"):  # state-dependent: gates change over the rollout
+        assert not torch.allclose(gates[0][0] * gates[0][1], gates[-1][0] * gates[-1][1])
+    model.train()
+    model(cond, scal).square().mean().backward()
+    assert all(q.grad is not None for q in model.parameters() if q.requires_grad)

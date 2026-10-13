@@ -31,7 +31,7 @@ import torch.nn.functional as F
 
 from .data.memory import MemoryStream
 from .data.mf_slices import MFMemorySplit
-from .model.rhizome import RhizomeOperator2d
+from .model.rhizome import build_model
 from .run import git_commit
 from .train_rhizome import LongRunConfig, PlateauState, _atomic_save, _cpu_state, _sha256
 
@@ -56,6 +56,15 @@ class MFConfig(LongRunConfig):
     # Ablation: drop the emulated global-history band means of x_HI ("xhi"), T_b ("tb") or both ("both")
     # from the scalars; the kept column indices are saved with the checkpoint for the exporter.
     drop_history: str = ""
+    # Two-level RhizomeUNet2d when > 0: a coarse rollout on the grid average-pooled by this factor, upsampled into
+    # the fine forcing. The fine level uses modes / radius / rank / updates as above.
+    coarse_factor: int = 0
+    coarse_modes: int = 0       # 0: every mode the coarse grid supports
+    coarse_updates: int = 3
+    coarse_radius: float = 0.0  # > 0: compact kernel of this radius in coarse cells
+    coarse_rank: int = 0
+    # Gate ablation (StateDependentIntegral2d): full | frozen | none | source | receiver | static.
+    gate_mode: str = "full"
 
 
 class PowerLoss(torch.nn.Module):
@@ -172,8 +181,18 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
                     "step_size": config.step_size}
     if config.radius:
         model_config.update(radius=config.radius, rank=config.rank or None)
+    if config.gate_mode != "full":
+        if config.coarse_factor:
+            raise ValueError("gate ablations are implemented for the single-level model")
+        model_config["gate_mode"] = config.gate_mode
+    if config.coarse_factor:
+        h, w = train.cond.shape[-2:]
+        model_config.update(kind="unet", factor=config.coarse_factor, coarse_steps=config.coarse_updates,
+                            coarse_modes=config.coarse_modes or min(h, w) // config.coarse_factor // 2,
+                            coarse_radius=config.coarse_radius or None, coarse_rank=config.coarse_rank or None)
+    if config.radius or config.coarse_radius:
         torch.backends.cudnn.benchmark = True  # cuDNN's default algorithm choice is erratic for wide stencils
-    model = RhizomeOperator2d(**model_config).to(device)
+    model = build_model(model_config).to(device)
     power = PowerLoss(*train.cond.shape[-2:], config.power_kmin, config.power_bins, config.power_eps).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     root = Path(__file__).resolve().parent.parent

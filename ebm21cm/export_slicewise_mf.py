@@ -26,7 +26,7 @@ import torch
 
 from .data.cache import band_extent
 from .data.mf_slices import FNO_ROOT, PREPARATION, band_means, fno_dataset
-from .model.rhizome import RhizomeOperator2d
+from .model.rhizome import build_model
 from .train_rhizome_mf2d import tb_normalized
 
 
@@ -148,7 +148,7 @@ def main(argv=None):
     ip = [list(dataset.channel_names).index(p) for p in param_names]
     best = torch.load(args.run / "best.pt", map_location="cpu", weights_only=False)
     device = torch.device(args.device)
-    model = RhizomeOperator2d(**best["model_config"]).to(device).eval()
+    model = build_model(best["model_config"]).to(device).eval()
     model.load_state_dict(best["model"])
     tb_off, tb_scale = best["tb_norm"]
     keep = best.get("scalar_keep")  # history-ablation models see a subset of the scalars
