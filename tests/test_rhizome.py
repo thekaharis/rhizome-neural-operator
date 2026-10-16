@@ -316,3 +316,188 @@ def test_unet_rollout_lengths_can_be_overridden():
     assert len(states) == (1 + 1) + (1 + 4)  # coarse h0 + 1 update, fine h0 + 4 updates
     assert torch.allclose(model(cond, scal), model(cond, scal, n_steps=2, coarse_steps=2))
     assert not torch.allclose(model(cond, scal), out)
+
+
+def _copy_dense_into_grouped(dense, grouped):
+    """Embed a dense SpectralConv2d's weights as group 0 of a GroupedSpectralConv2d (others zero)."""
+    k = dense.in_channels
+    with torch.no_grad():
+        for name in ("dc", "axis", "positive", "negative"):
+            target = getattr(grouped, name)
+            target.zero_()
+            target[0, :k, :k] = getattr(dense, name)
+
+
+@pytest.mark.parametrize("groups", [1, 2, 4])
+def test_grouped_spectral_conv_is_block_diagonal_dense(groups):
+    from ebm21cm.model.rhizome import GroupedSpectralConv2d
+
+    torch.manual_seed(2)
+    channels, modes = 4, 3
+    grouped = GroupedSpectralConv2d(channels, modes, groups).double()
+    dense = SpectralConv2d(channels, channels, modes).double()
+    k = channels // groups
+    with torch.no_grad():  # dense weights = block-diagonal embedding of the grouped ones
+        for name in ("dc", "axis", "positive", "negative"):
+            d, g = getattr(dense, name), getattr(grouped, name)
+            d.zero_()
+            for i in range(groups):
+                d[i * k:(i + 1) * k, i * k:(i + 1) * k] = g[i].to(d.dtype)
+    x = torch.randn(2, channels, 8, 9, dtype=torch.float64)
+    assert torch.allclose(grouped(x), dense(x), atol=1e-12)
+
+
+def test_single_dense_pathway_reproduces_state_dependent_integral():
+    from ebm21cm.model.rhizome import MultiPathIntegral2d
+
+    torch.manual_seed(3)
+    old = StateDependentIntegral2d(3, modes=3).double()
+    new = MultiPathIntegral2d(3, modes=3, pathways=1, groups=1).double()
+    new.gates.load_state_dict(old.gates.state_dict())
+    new.value.load_state_dict(old.value.state_dict())
+    _copy_dense_into_grouped(old.kernel, new.kernel)
+    state, forcing = torch.randn(2, 3, 8, 8, dtype=torch.float64), torch.randn(2, 3, 8, 8, dtype=torch.float64)
+    assert torch.allclose(new(state, forcing), old(state, forcing), atol=1e-12)
+
+
+def test_pathways_are_independent_concatenated_and_shareable():
+    from ebm21cm.model.rhizome import MultiPathIntegral2d
+
+    torch.manual_seed(4)
+    width, modes = 4, 3
+    state, forcing = torch.randn(2, width, 8, 8, dtype=torch.float64), torch.randn(2, width, 8, 8, dtype=torch.float64)
+    free = MultiPathIntegral2d(width, modes, pathways=2, groups=width).double()
+    out = free(state, forcing)
+    assert out.shape == (2, 2 * width, 8, 8)
+    # Each pathway is its own depthwise interaction: zeroing pathway 1's kernel leaves pathway 0 untouched.
+    with torch.no_grad():
+        for name in ("dc", "axis", "positive", "negative"):
+            getattr(free.kernel, name)[width:] = 0
+    cut = free(state, forcing)
+    assert torch.allclose(cut[:, :width], out[:, :width]) and cut[:, width:].abs().max() < 1e-12
+    # Shared kernels equal independent pathways with copied kernels.
+    shared = MultiPathIntegral2d(width, modes, pathways=2, groups=width, share="kernels").double()
+    tied = MultiPathIntegral2d(width, modes, pathways=2, groups=width).double()
+    tied.gates.load_state_dict(shared.gates.state_dict())
+    tied.value.load_state_dict(shared.value.state_dict())
+    with torch.no_grad():
+        for name in ("dc", "axis", "positive", "negative"):
+            getattr(tied.kernel, name).copy_(getattr(shared.kernel, name).repeat(2, *[1] * (getattr(shared.kernel, name).ndim - 1)))
+    assert torch.allclose(shared(state, forcing), tied(state, forcing), atol=1e-12)
+    # Shared gates are repeated over pathways.
+    gated = MultiPathIntegral2d(width, modes, pathways=2, groups=width, share="gates").double()
+    source, receiver, _ = gated.factors(state, forcing)
+    assert torch.equal(source[:, :width], source[:, width:]) and torch.equal(receiver[:, :width], receiver[:, width:])
+
+
+@pytest.mark.parametrize("pathways,groups,share", [(1, 4, ""), (2, 4, ""), (2, 1, ""), (2, 2, "gates"), (2, 4, "kernels")])
+def test_multipath_model_rolls_and_backpropagates(pathways, groups, share):
+    torch.manual_seed(5)
+    model = RhizomeOperator2d(3, 2, 4, width=4, modes=3, n_steps=2,
+                              pathways=pathways, kernel_groups=groups, share=share).double()
+    cond, scal = torch.randn(2, 3, 12, 10, dtype=torch.float64), torch.randn(2, 4, dtype=torch.float64)
+    out = model(cond, scal)
+    roll = lambda x: torch.roll(x, shifts=(3, -5), dims=(-2, -1))
+    assert torch.allclose(model(roll(cond), scal), roll(out), atol=1e-10)
+    out.square().mean().backward()
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
+
+
+def test_multipath_rejects_unsupported_combinations():
+    with pytest.raises(ValueError, match="single|spectral"):
+        RhizomeOperator2d(3, width=4, modes=3, radius=1, pathways=2)
+    with pytest.raises(ValueError, match="divisible"):
+        RhizomeOperator2d(3, width=4, modes=3, kernel_groups=3)
+    with pytest.raises(ValueError, match="share"):
+        RhizomeOperator2d(3, width=4, modes=3, pathways=2, share="values")
+
+
+def test_kernel_overlap_detects_collapsed_filters():
+    from ebm21cm.model.rhizome import GroupedSpectralConv2d, kernel_overlap
+
+    torch.manual_seed(6)
+    conv = GroupedSpectralConv2d(6, 4, groups=6)
+    _, rank = kernel_overlap(conv)
+    assert rank > 4  # random filters are nearly orthogonal
+    with torch.no_grad():
+        for name in ("dc", "axis", "positive", "negative"):
+            p = getattr(conv, name)
+            p.copy_(p[:1].expand_as(p) * torch.arange(1, 7).view(-1, *[1] * (p.ndim - 1)))
+    gram, rank = kernel_overlap(conv)
+    assert torch.allclose(gram, torch.ones_like(gram), atol=1e-5) and rank == pytest.approx(1, abs=1e-4)
+
+
+@pytest.mark.parametrize("shape,radius", [((12, 12), 2), ((11, 14), 2.5), ((16, 13), 3)])
+def test_disc_fft_conv_matches_direct_periodic_sum_and_local_conv(shape, radius):
+    from ebm21cm.model.rhizome import DiscFFTConv2d
+
+    torch.manual_seed(7)
+    channels = 3
+    disc = DiscFFTConv2d(channels, radius).double()
+    x = torch.randn(2, channels, *shape, dtype=torch.float64, requires_grad=True)
+    expected = sum(disc.weight[:, k, None, None] * torch.roll(x, (-int(dy), -int(dx)), dims=(2, 3))
+                   for k, (dy, dx) in enumerate(disc_offsets(radius)))
+    actual = disc(x)
+    assert torch.allclose(actual, expected, atol=1e-12)
+    probe = torch.randn_like(actual)
+    for a, e in zip(torch.autograd.grad((actual * probe).sum(), (x, disc.weight), retain_graph=True),
+                    torch.autograd.grad((expected * probe).sum(), (x, disc.weight))):
+        assert torch.allclose(a, e, atol=1e-10)
+    # The same operator as a depthwise LocalConv2d (rank = channels, identity projections).
+    local = LocalConv2d(channels, radius, rank=channels).double()
+    with torch.no_grad():
+        local.proj_in.copy_(torch.eye(channels, dtype=torch.float64)[:, :, None, None])
+        local.proj_out.copy_(torch.eye(channels, dtype=torch.float64)[:, :, None, None])
+        local.weight.copy_(disc.weight[:, None])
+    assert torch.allclose(local(x), actual, atol=1e-12)
+
+
+def test_disc_pathway_model_influence_stays_inside_steps_times_radius():
+    torch.manual_seed(0)
+    model = RhizomeOperator2d(4, width=6, modes=2, n_steps=2, disc_radius=1.5, disc_pathways=1).double().eval()
+    x = torch.randn(1, 4, 12, 13, dtype=torch.float64)
+    bumped = x.clone()
+    bumped[0, :, 0, 5] += 1.0
+    changed = (model(bumped) - model(x)).abs()[0, 0] > 1e-12  # FFT round-off elsewhere
+    i, j = torch.meshgrid(torch.arange(12), torch.arange(13), indexing="ij")
+    di, dj = torch.minimum(i, 12 - i), torch.minimum((j - 5).abs(), 13 - (j - 5).abs())
+    dist = (di.square() + dj.square()).double().sqrt()
+    assert changed[dist <= 1.5].all() and not changed[dist > 2 * 1.5 + 1e-9].any()
+    assert changed[dist > 1.5].any()
+
+
+def test_hybrid_spectral_and_disc_pathways():
+    from ebm21cm.model.rhizome import DiscFFTConv2d, GroupedSpectralConv2d, MultiPathIntegral2d
+
+    torch.manual_seed(8)
+    width = 4
+    hybrid = MultiPathIntegral2d(width, 3, pathways=2, groups=width, disc_radius=2, disc_pathways=1).double()
+    assert isinstance(hybrid.kernel, GroupedSpectralConv2d) and hybrid.kernel.channels == width
+    assert isinstance(hybrid.disc, DiscFFTConv2d) and hybrid.disc.channels == width
+    state, forcing = torch.randn(2, width, 10, 10, dtype=torch.float64), torch.randn(2, width, 10, 10, dtype=torch.float64)
+    out = hybrid(state, forcing)
+    with torch.no_grad():
+        hybrid.disc.weight.zero_()
+    cut = hybrid(state, forcing)  # pathway 0 (spectral) untouched, pathway 1 (disc) silenced
+    assert torch.allclose(cut[:, :width], out[:, :width]) and cut[:, width:].abs().max() < 1e-12
+    model = RhizomeOperator2d(3, 2, 4, width=4, modes=3, n_steps=2, pathways=2, kernel_groups=4,
+                              disc_radius=2, disc_pathways=1).double()
+    cond, scal = torch.randn(2, 3, 12, 10, dtype=torch.float64), torch.randn(2, 4, dtype=torch.float64)
+    out = model(cond, scal)
+    roll = lambda x: torch.roll(x, shifts=(3, -5), dims=(-2, -1))
+    assert torch.allclose(model(roll(cond), scal), roll(out), atol=1e-10)
+    out.square().mean().backward()
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
+
+
+def test_disc_pathway_validation():
+    from ebm21cm.model.rhizome import MultiPathIntegral2d
+
+    with pytest.raises(ValueError, match="disc_pathways"):
+        MultiPathIntegral2d(4, 3, pathways=1, disc_radius=2, disc_pathways=2)
+    with pytest.raises(ValueError, match="disc_pathways"):
+        MultiPathIntegral2d(4, 3, pathways=2, disc_pathways=1)
+    with pytest.raises(ValueError, match="same kernel type"):
+        MultiPathIntegral2d(4, 3, pathways=2, share="kernels", disc_radius=2, disc_pathways=1)
+    with pytest.raises(ValueError, match="too small"):
+        RhizomeOperator2d(3, width=4, modes=2, disc_radius=5, disc_pathways=1)(torch.randn(1, 3, 8, 8))

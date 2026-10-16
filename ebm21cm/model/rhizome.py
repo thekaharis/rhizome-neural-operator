@@ -16,6 +16,13 @@ self, sqrt(2) the 3x3 square), evaluated as a direct periodic convolution.
 After T updates a site sees at most T*R cells away. ``rank=r`` factorizes it
 as K(d) = P_out diag(w(d)) P_in (C->r->C channel projections, r weights per
 offset). Offsets are in cells, so R has no fixed physical scale across grids.
+
+``pathways=R`` (MultiPathIntegral2d) gives R such terms, each with its own gates,
+values and Fourier kernel (``kernel_groups`` dense channel blocks; = width is
+depthwise), concatenated into the pointwise update rather than summed.
+``disc_pathways`` of them can instead use a depthwise disc kernel of
+``disc_radius`` cells applied by FFT (DiscFFTConv2d), whose cost does not grow
+with the radius.
 """
 
 from __future__ import annotations
@@ -135,14 +142,195 @@ class StateDependentIntegral2d(nn.Module):
         return receiver * self.kernel(source * value)
 
 
-class IntegralUpdate(nn.Module):
-    """One shared interaction law followed by a strictly pointwise state update."""
+class GroupedSpectralConv2d(nn.Module):
+    """SpectralConv2d with block-diagonal channel mixing: ``groups`` independent dense blocks.
 
-    def __init__(self, width, modes, step_size, radius=None, rank=None, gate_mode="full"):
+    ``groups=1`` is SpectralConv2d (same retained modes and Hermitian handling);
+    ``groups=channels`` is depthwise, one global Fourier filter per channel and no
+    channel mixing. Input and output have the same number of channels.
+    """
+
+    def __init__(self, channels, modes, groups=1):
+        super().__init__()
+        self.channels = _integer("channels", channels)
+        self.modes = _integer("modes", modes)
+        self.groups = _integer("groups", groups)
+        if channels % groups:
+            raise ValueError(f"channels {channels} not divisible by groups {groups}")
+        g, k = groups, channels // groups
+        scale = (k * channels) ** -0.5  # (C*C)^-1/2 for dense, as SpectralConv2d; C^-1/2 for depthwise
+        self.dc = nn.Parameter(scale * torch.randn(g, k, k))
+        self.axis = nn.Parameter(scale * torch.randn(g, k, k, modes - 1, dtype=torch.cfloat))
+        self.positive = nn.Parameter(scale * torch.randn(g, k, k, modes, modes - 1, dtype=torch.cfloat))
+        self.negative = nn.Parameter(scale * torch.randn(g, k, k, modes - 1, modes - 1, dtype=torch.cfloat))
+
+    def _mix(self, spectrum, weight):
+        """(B,G,k,...) x (G,k,k,...) -> (B,G,k,...); elementwise when depthwise."""
+        weight = weight.to(spectrum.dtype)
+        if weight.shape[1] == 1:
+            return spectrum * weight[:, 0]
+        return torch.einsum("bgi...,gio...->bgo...", spectrum, weight)
+
+    def forward(self, x):
+        if x.ndim != 4 or x.shape[1] != self.channels:
+            raise ValueError(f"expected (B,{self.channels},H,W) input")
+        h, w = x.shape[-2:]
+        if min(h, w) < 2 * self.modes:
+            raise ValueError(f"both grid dimensions must be >= 2*modes={2 * self.modes}, got {(h, w)}")
+        if x.dtype in (torch.float16, torch.bfloat16):
+            x = x.float()
+        if x.dtype not in (torch.float32, torch.float64):
+            raise ValueError("Fourier inputs must use float32 or float64")
+        b, m = x.shape[0], self.modes
+        spectrum = torch.fft.rfft2(x, norm="ortho").unflatten(1, (self.groups, -1))
+        out = spectrum.new_zeros(spectrum.shape)
+        out[..., 0, 0] = self._mix(spectrum[..., 0, 0].real, self.dc)
+        if m > 1:
+            axis = self._mix(spectrum[..., 1:m, 0], self.axis)
+            out[..., 1:m, 0] = axis
+            out[..., -(m - 1):, 0] = axis.flip(-1).conj()
+            out[..., :m, 1:m] = self._mix(spectrum[..., :m, 1:m], self.positive)
+            out[..., -(m - 1):, 1:m] = self._mix(spectrum[..., -(m - 1):, 1:m], self.negative)
+        return torch.fft.irfft2(out.reshape(b, self.channels, h, w // 2 + 1), s=(h, w), norm="ortho")
+
+    def filters(self):
+        """Every retained coefficient of each (group, in, out) filter, as a (n_filters, n_coeffs) complex matrix."""
+        parts = (self.dc.to(self.axis.dtype)[..., None], self.axis, self.positive.flatten(-2), self.negative.flatten(-2))
+        return torch.cat(parts, dim=-1).flatten(0, 2)
+
+
+class DiscFFTConv2d(nn.Module):
+    """Depthwise kernel supported on a disc, kappa(d) = 0 for |d| > radius cells, evaluated by FFT.
+
+    Same operator as a depthwise LocalConv2d, y(r) = sum_{|d|<=R} w(d) x(r+d) per
+    channel on the periodic grid, but the weights are scattered into a full-grid
+    kernel image and applied by multiplication over every Fourier mode. The cost
+    does not depend on the radius. Offsets are in cells, as for LocalConv2d.
+    """
+
+    def __init__(self, channels, radius):
+        super().__init__()
+        self.channels = _integer("channels", channels)
+        self.radius = float(radius)
+        offsets = disc_offsets(radius)
+        self.reach = int(offsets.max())
+        self.register_buffer("offsets", offsets, persistent=False)
+        self.weight = nn.Parameter(torch.randn(channels, len(offsets)) / len(offsets) ** 0.5)
+
+    def forward(self, x):
+        if x.ndim != 4 or x.shape[1] != self.channels:
+            raise ValueError(f"expected (B,{self.channels},H,W) input")
+        h, w = x.shape[-2:]
+        if min(h, w) < 2 * self.reach + 1:
+            raise ValueError(f"grid {(h, w)} too small for radius {self.radius}")
+        if x.dtype in (torch.float16, torch.bfloat16):
+            x = x.float()
+        # Correlation y(r) = sum_d w(d) x(r+d) is the convolution with kappa(-d) = w(d).
+        kernel = x.new_zeros(self.channels, h, w)
+        kernel[:, (-self.offsets[:, 0]) % h, (-self.offsets[:, 1]) % w] = self.weight.to(x.dtype)
+        spectrum = torch.fft.rfft2(x) * torch.fft.rfft2(kernel)
+        return torch.fft.irfft2(spectrum, s=(h, w))
+
+
+PATHWAY_SHARING = ("", "gates", "kernels")
+
+
+class MultiPathIntegral2d(nn.Module):
+    """R communication pathways m_r = A_r * kappa_r(B_r * V_r), returned concatenated as (B, R*C, H, W).
+
+    Each pathway has its own endpoint gates A_r, B_r in (0,2), its own transmitted
+    values V_r (pointwise from [h, c]) and its own Fourier kernel kappa_r with
+    ``groups`` dense channel blocks (1: dense C x C, C: depthwise). The pathways
+    are concatenated, not summed; the update's pointwise proposal is the signed
+    output mixing W_o (a separate linear W_o in front of it would be redundant).
+    ``share="gates"``: one (A, B) for all pathways; ``share="kernels"``: one kappa.
+
+    With nothing shared, R pathways of C channels are exactly one pathway of R*C
+    channels with R*groups blocks: R widens the message, not the hidden state.
+    pathways=1, groups=1 is StateDependentIntegral2d with gate_mode="full".
+
+    ``disc_pathways=D`` makes the last D pathways use a depthwise disc kernel of
+    ``disc_radius`` cells (DiscFFTConv2d: compact in space, every Fourier mode)
+    instead of the Fourier one (global, ``modes`` lowest modes only).
+    """
+
+    def __init__(self, width, modes, pathways=1, groups=1, share="", disc_radius=None, disc_pathways=0):
+        super().__init__()
+        self.width = _integer("width", width)
+        self.pathways = _integer("pathways", pathways)
+        if share not in PATHWAY_SHARING:
+            raise ValueError(f"share must be one of {PATHWAY_SHARING}")
+        self.share = share
+        self.disc_pathways = _integer("disc_pathways", disc_pathways, minimum=0)
+        if disc_pathways > pathways or (disc_pathways > 0) != (disc_radius is not None):
+            raise ValueError("disc_pathways must be in [1, pathways] exactly when disc_radius is given")
+        if disc_pathways and share == "kernels":
+            raise ValueError("share='kernels' needs every pathway to use the same kernel type")
+        self.gates = nn.Conv2d(2 * width, 2 * width * (1 if share == "gates" else pathways), 1)
+        self.value = nn.Conv2d(2 * width, width * pathways, 1, bias=False)
+        spectral = pathways - disc_pathways
+        if share == "kernels":
+            self.kernel = GroupedSpectralConv2d(width, modes, groups)
+        elif spectral:
+            self.kernel = GroupedSpectralConv2d(width * spectral, modes, groups * spectral)
+        else:
+            self.kernel = None
+        self.disc = DiscFFTConv2d(width * disc_pathways, disc_radius) if disc_pathways else None
+
+    def factors(self, state, forcing):
+        """Source gates, receiver gates, and transmitted values, all (B,R*C,H,W), pathway-major."""
+        if state.ndim != 4 or state.shape != forcing.shape or state.shape[1] != self.width:
+            raise ValueError(f"state and forcing must have matching (B,{self.width},H,W) shapes")
+        context = torch.cat([state, forcing], dim=1)
+        source, receiver = (2 * self.gates(context).sigmoid()).chunk(2, dim=1)
+        if self.share == "gates":
+            source, receiver = source.repeat(1, self.pathways, 1, 1), receiver.repeat(1, self.pathways, 1, 1)
+        return source, receiver, self.value(context)
+
+    def forward(self, state, forcing):
+        source, receiver, value = self.factors(state, forcing)
+        sent = source * value
+        if self.share == "kernels":  # the same kappa on every pathway: fold pathways into the batch
+            return receiver * self.kernel(sent.unflatten(1, (self.pathways, -1)).flatten(0, 1)).view_as(sent)
+        if self.disc is None:
+            return receiver * self.kernel(sent)
+        if self.kernel is None:
+            return receiver * self.disc(sent)
+        split = (self.pathways - self.disc_pathways) * self.width
+        return receiver * torch.cat([self.kernel(sent[:, :split]), self.disc(sent[:, split:])], dim=1)
+
+
+def kernel_overlap(conv):
+    """|cosine| Gram matrix of a GroupedSpectralConv2d's filters and its participation-ratio effective rank.
+
+    Identical (collapsed) filters give |cos| = 1 off the diagonal and an effective rank near 1.
+    """
+    f = conv.filters().detach()
+    f = f / f.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    gram = (f.conj() @ f.T).abs()
+    eig = torch.linalg.eigvalsh(f.conj() @ f.T).clamp_min(0)
+    return gram, float(eig.sum() ** 2 / eig.square().sum())
+
+
+class IntegralUpdate(nn.Module):
+    """One shared interaction law followed by a strictly pointwise state update.
+
+    ``pathways`` / ``kernel_groups`` / ``share`` / ``disc_pathways`` other than
+    (1, 1, "", 0) use MultiPathIntegral2d, whose R*C concatenated messages enter the proposal.
+    """
+
+    def __init__(self, width, modes, step_size, radius=None, rank=None, gate_mode="full",
+                 pathways=1, kernel_groups=1, share="", disc_radius=None, disc_pathways=0):
         super().__init__()
         self.step_size = step_size
-        self.interaction = StateDependentIntegral2d(width, modes, radius, rank, gate_mode)
-        self.proposal = nn.Conv2d(3 * width, width, 1)
+        if (pathways, kernel_groups, share, disc_pathways) == (1, 1, "", 0):
+            self.interaction = StateDependentIntegral2d(width, modes, radius, rank, gate_mode)
+        else:
+            if radius is not None or gate_mode != "full":
+                raise ValueError("multi-pathway interactions are spectral with gate_mode='full'")
+            self.interaction = MultiPathIntegral2d(width, modes, pathways, kernel_groups, share,
+                                                   disc_radius, disc_pathways)
+        self.proposal = nn.Conv2d((2 + pathways) * width, width, 1)
 
     def forward(self, state, forcing):
         message = self.interaction(state, forcing)
@@ -170,13 +358,18 @@ class RhizomeOperator2d(_RecurrentField2d):
     ``radius`` (cells) swaps in the compact real-space kernel; ``modes`` is then unused.
     ``gate_mode`` selects a gate ablation (see StateDependentIntegral2d); "frozen"
     relies on the initial state being tanh(forcing), as here.
+    ``pathways`` / ``kernel_groups`` / ``share`` / ``disc_radius`` / ``disc_pathways``
+    select MultiPathIntegral2d.
     """
 
     def __init__(self, in_channels, out_channels=1, scalar_dim=0, width=24, modes=6,
-                 n_steps=6, step_size=0.5, untied=False, radius=None, rank=None, gate_mode="full"):
+                 n_steps=6, step_size=0.5, untied=False, radius=None, rank=None, gate_mode="full",
+                 pathways=1, kernel_groups=1, share="", disc_radius=None, disc_pathways=0):
         super().__init__(
             in_channels, out_channels, scalar_dim, width, modes, n_steps, step_size, untied,
-            partial(IntegralUpdate, radius=radius, rank=rank, gate_mode=gate_mode),
+            partial(IntegralUpdate, radius=radius, rank=rank, gate_mode=gate_mode,
+                    pathways=pathways, kernel_groups=kernel_groups, share=share,
+                    disc_radius=disc_radius, disc_pathways=disc_pathways),
         )
 
 

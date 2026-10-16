@@ -69,6 +69,16 @@ class MFConfig(LongRunConfig):
     # seed and step), so the decoder cannot tune itself to one rollout length; validation stays at --updates.
     random_updates: str = ""
     random_coarse_updates: str = ""  # the same for the coarse level of the two-level model ("" = fixed)
+    # Multi-pathway interaction (MultiPathIntegral2d, single-level spectral model): R pathways, each with its own
+    # gates, values and Fourier kernel of kernel_groups dense channel blocks (1 = dense C x C, width = depthwise),
+    # concatenated into the proposal. share_pathways: "" | gates | kernels ties that part across pathways.
+    pathways: int = 1
+    kernel_groups: int = 1
+    share_pathways: str = ""
+    # The last disc_pathways pathways use a depthwise disc kernel of disc_radius cells applied by FFT (DiscFFTConv2d)
+    # instead of the Fourier one: compact in space, every Fourier mode, cost independent of the radius.
+    disc_radius: float = 0.0
+    disc_pathways: int = 0
 
 
 class PowerLoss(torch.nn.Module):
@@ -200,6 +210,15 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
         if config.coarse_factor:
             raise ValueError("gate ablations are implemented for the single-level model")
         model_config["gate_mode"] = config.gate_mode
+    if bool(config.disc_radius) != bool(config.disc_pathways):
+        raise ValueError("disc_radius and disc_pathways must be set together")
+    if (config.pathways, config.kernel_groups, config.share_pathways, config.disc_pathways) != (1, 1, "", 0):
+        if config.coarse_factor or config.radius:
+            raise ValueError("multi-pathway interactions are implemented for the single-level spectral model")
+        model_config.update(pathways=config.pathways, kernel_groups=config.kernel_groups,
+                            share=config.share_pathways)
+        if config.disc_pathways:
+            model_config.update(disc_radius=config.disc_radius, disc_pathways=config.disc_pathways)
     if config.coarse_factor:
         h, w = train.cond.shape[-2:]
         model_config.update(kind="unet", factor=config.coarse_factor, coarse_steps=config.coarse_updates,

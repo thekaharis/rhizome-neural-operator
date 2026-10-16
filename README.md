@@ -36,6 +36,9 @@ For long training, `python -m ebm21cm.train_rhizome` adds validation-driven
 learning-rate reductions, an explicit plateau stopping rule, and resumable
 checkpoints. See [the long-training protocol](docs/rhizome_long_training.md).
 
+The [multi-pathway interaction](docs/rhizome_multipath.md) (`--pathways`, `--kernel-groups`,
+`--share-pathways`) splits the dense spectral kernel into gated depthwise or grouped pathways.
+
 ## Why
 
 A deterministic regressor trained with a pointwise loss predicts the conditional
