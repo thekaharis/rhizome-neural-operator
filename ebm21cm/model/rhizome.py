@@ -227,7 +227,10 @@ class RhizomeUNet2d(nn.Module):
         forcing = lift(cond)
         return forcing if embed is None else forcing + embed(scalars)[:, :, None, None]
 
-    def forward(self, cond, scalars=None, *, return_states=False):
+    def forward(self, cond, scalars=None, *, n_steps=None, coarse_steps=None, return_states=False):
+        """``n_steps`` / ``coarse_steps`` override the configured fine / coarse rollout lengths (tied updates)."""
+        fine_steps = self.n_steps if n_steps is None else _integer("n_steps", n_steps)
+        coarse_steps = self.coarse_steps if coarse_steps is None else _integer("coarse_steps", coarse_steps)
         if cond.ndim != 4 or cond.shape[1] != self.in_channels or min(cond.shape) < 1:
             raise ValueError(f"expected nonempty (B,{self.in_channels},H,W) conditioning")
         if cond.dtype not in (torch.float32, torch.float64):
@@ -241,7 +244,7 @@ class RhizomeUNet2d(nn.Module):
         forcing_c = self._forcing(self.lift_coarse, self.scalar_coarse, F.avg_pool2d(cond, self.factor), scalars)
         coarse = forcing_c.tanh()
         states = [coarse] if return_states else None
-        for _ in range(self.coarse_steps):
+        for _ in range(coarse_steps):
             coarse = self.coarse(coarse, forcing_c)
             if return_states:
                 states.append(coarse)
@@ -250,7 +253,7 @@ class RhizomeUNet2d(nn.Module):
         state = forcing_f.tanh()
         if return_states:
             states.append(state)
-        for _ in range(self.n_steps):
+        for _ in range(fine_steps):
             state = self.fine(state, forcing_f)
             if return_states:
                 states.append(state)

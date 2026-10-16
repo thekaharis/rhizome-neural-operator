@@ -304,3 +304,15 @@ def test_gate_modes(mode):
     model.train()
     model(cond, scal).square().mean().backward()
     assert all(q.grad is not None for q in model.parameters() if q.requires_grad)
+
+
+def test_unet_rollout_lengths_can_be_overridden():
+    from ebm21cm.model.rhizome import RhizomeUNet2d
+
+    torch.manual_seed(0)
+    model = RhizomeUNet2d(3, 2, 4, width=6, modes=3, n_steps=2, factor=4, coarse_modes=2, coarse_steps=2).double()
+    cond, scal = torch.randn(1, 3, 16, 16, dtype=torch.float64), torch.randn(1, 4, dtype=torch.float64)
+    out, states = model(cond, scal, n_steps=4, coarse_steps=1, return_states=True)
+    assert len(states) == (1 + 1) + (1 + 4)  # coarse h0 + 1 update, fine h0 + 4 updates
+    assert torch.allclose(model(cond, scal), model(cond, scal, n_steps=2, coarse_steps=2))
+    assert not torch.allclose(model(cond, scal), out)

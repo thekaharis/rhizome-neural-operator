@@ -65,6 +65,10 @@ class MFConfig(LongRunConfig):
     coarse_rank: int = 0
     # Gate ablation (StateDependentIntegral2d): full | frozen | none | source | receiver | static.
     gate_mode: str = "full"
+    # "lo:hi": every training step rolls out T ~ U{lo, ..., hi} tied updates (one T per batch, reproducible from
+    # seed and step), so the decoder cannot tune itself to one rollout length; validation stays at --updates.
+    random_updates: str = ""
+    random_coarse_updates: str = ""  # the same for the coarse level of the two-level model ("" = fixed)
 
 
 class PowerLoss(torch.nn.Module):
@@ -181,6 +185,17 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
                     "step_size": config.step_size}
     if config.radius:
         model_config.update(radius=config.radius, rank=config.rank or None)
+    def parse_range(text, name):
+        if not text:
+            return None
+        lo_hi = tuple(int(v) for v in text.split(":"))
+        if len(lo_hi) != 2 or not 1 <= lo_hi[0] <= lo_hi[1]:
+            raise ValueError(f"{name} must be 'lo:hi' with 1 <= lo <= hi")
+        return lo_hi
+    t_range = parse_range(config.random_updates, "random_updates")
+    tc_range = parse_range(config.random_coarse_updates, "random_coarse_updates")
+    if tc_range and not config.coarse_factor:
+        raise ValueError("random_coarse_updates needs the two-level model (--coarse-factor)")
     if config.gate_mode != "full":
         if config.coarse_factor:
             raise ValueError("gate ablations are implemented for the single-level model")
@@ -247,7 +262,13 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
         batch = stream.next()
         y = batch["target"]
         optimizer.zero_grad(set_to_none=True)
-        out = model(batch["cond"], batch["scalars"])
+        rng = np.random.default_rng([config.seed, step])
+        steps = {}
+        if t_range:
+            steps["n_steps"] = int(rng.integers(t_range[0], t_range[1] + 1))
+        if tc_range:
+            steps["coarse_steps"] = int(rng.integers(tc_range[0], tc_range[1] + 1))
+        out = model(batch["cond"], batch["scalars"], **steps)
         t = tb_normalized(out, batch["phys"], config.head, *tb_norm)
         loss = F.binary_cross_entropy_with_logits(out[:, :1], y[:, :1]) + config.tb_weight * F.mse_loss(t, y[:, 1:])
         if config.power_weight:
