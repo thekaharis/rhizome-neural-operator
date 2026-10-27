@@ -79,6 +79,7 @@ class MFConfig(LongRunConfig):
     # instead of the Fourier one: compact in space, every Fourier mode, cost independent of the radius.
     disc_radius: float = 0.0
     disc_pathways: int = 0
+    disc_norm: str = ""  # "l1": disc weights g * v / sum|v| per channel, total weight independent of the disc area
 
 
 class PowerLoss(torch.nn.Module):
@@ -212,6 +213,8 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
         model_config["gate_mode"] = config.gate_mode
     if bool(config.disc_radius) != bool(config.disc_pathways):
         raise ValueError("disc_radius and disc_pathways must be set together")
+    if config.disc_norm and not config.disc_pathways:
+        raise ValueError("disc_norm needs disc pathways")
     if (config.pathways, config.kernel_groups, config.share_pathways, config.disc_pathways) != (1, 1, "", 0):
         if config.coarse_factor or config.radius:
             raise ValueError("multi-pathway interactions are implemented for the single-level spectral model")
@@ -219,6 +222,8 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
                             share=config.share_pathways)
         if config.disc_pathways:
             model_config.update(disc_radius=config.disc_radius, disc_pathways=config.disc_pathways)
+            if config.disc_norm:
+                model_config["disc_norm"] = config.disc_norm
     if config.coarse_factor:
         h, w = train.cond.shape[-2:]
         model_config.update(kind="unet", factor=config.coarse_factor, coarse_steps=config.coarse_updates,

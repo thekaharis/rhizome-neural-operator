@@ -501,3 +501,41 @@ def test_disc_pathway_validation():
         MultiPathIntegral2d(4, 3, pathways=2, share="kernels", disc_radius=2, disc_pathways=1)
     with pytest.raises(ValueError, match="too small"):
         RhizomeOperator2d(3, width=4, modes=2, disc_radius=5, disc_pathways=1)(torch.randn(1, 3, 8, 8))
+
+
+@pytest.mark.parametrize("radius", [2, 8, 16])
+def test_l1_disc_kernel_scale_is_independent_of_radius(radius):
+    from ebm21cm.model.rhizome import DiscFFTConv2d
+
+    torch.manual_seed(9)
+    disc = DiscFFTConv2d(3, radius, norm="l1").double()
+    with torch.no_grad():
+        disc.gain.copy_(torch.tensor([1.0, -0.5, 2.0], dtype=torch.float64))
+    w = disc.effective_weight()
+    assert torch.allclose(w.abs().sum(1), disc.gain.abs())  # total weight = |gain|, any number of disc cells
+    x = torch.randn(2, 3, 2 * int(radius) + 3, 2 * int(radius) + 4, dtype=torch.float64)
+    expected = sum(w[:, k, None, None] * torch.roll(x, (-int(dy), -int(dx)), dims=(2, 3))
+                   for k, (dy, dx) in enumerate(disc_offsets(radius)))
+    assert torch.allclose(disc(x), expected, atol=1e-12)
+    disc(x).square().mean().backward()
+    assert disc.weight.grad.abs().sum() > 0 and disc.gain.grad.abs().sum() > 0
+    # A constant field passes through with gain * (signed weight sum)/(abs sum): bounded by |gain|.
+    ones = torch.ones(1, 3, 2 * int(radius) + 3, 2 * int(radius) + 3, dtype=torch.float64)
+    assert (disc(ones).abs().amax((2, 3))[0] <= disc.gain.abs() + 1e-12).all()
+
+
+def test_disc_norm_default_is_unchanged_and_validated():
+    from ebm21cm.model.rhizome import DiscFFTConv2d, MultiPathIntegral2d
+
+    disc = DiscFFTConv2d(2, 3)
+    assert disc.effective_weight() is disc.weight and not hasattr(disc, "gain")
+    with pytest.raises(ValueError, match="norm"):
+        DiscFFTConv2d(2, 3, norm="l2")
+    with pytest.raises(ValueError, match="disc_norm"):
+        MultiPathIntegral2d(4, 3, pathways=2, disc_norm="l1")
+    model = RhizomeOperator2d(3, 2, 4, width=4, modes=3, n_steps=2, pathways=2, kernel_groups=4,
+                              disc_radius=2, disc_pathways=1, disc_norm="l1").double()
+    assert model.cells[0].interaction.disc.norm == "l1"
+    cond, scal = torch.randn(2, 3, 12, 10, dtype=torch.float64), torch.randn(2, 4, dtype=torch.float64)
+    roll = lambda x: torch.roll(x, shifts=(3, -5), dims=(-2, -1))
+    assert torch.allclose(model(roll(cond), scal), roll(model(cond, scal)), atol=1e-10)

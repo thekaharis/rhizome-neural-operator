@@ -206,16 +206,33 @@ class DiscFFTConv2d(nn.Module):
     channel on the periodic grid, but the weights are scattered into a full-grid
     kernel image and applied by multiplication over every Fourier mode. The cost
     does not depend on the radius. Offsets are in cells, as for LocalConv2d.
+
+    ``norm="l1"`` uses w(d) = g * v(d) / sum_d |v(d)| per channel, with a learned
+    gain g (init 1): the kernel's total absolute weight is |g| whatever the number
+    of disc cells, and only the single gain sets its scale. Unnormalized, every
+    one of the ~pi R^2 weights takes its own Adam step, so the total can grow in
+    proportion to the disc area.
     """
 
-    def __init__(self, channels, radius):
+    def __init__(self, channels, radius, norm=""):
         super().__init__()
         self.channels = _integer("channels", channels)
         self.radius = float(radius)
+        if norm not in ("", "l1"):
+            raise ValueError("disc kernel norm must be '' or 'l1'")
+        self.norm = norm
         offsets = disc_offsets(radius)
         self.reach = int(offsets.max())
         self.register_buffer("offsets", offsets, persistent=False)
         self.weight = nn.Parameter(torch.randn(channels, len(offsets)) / len(offsets) ** 0.5)
+        if norm == "l1":
+            self.gain = nn.Parameter(torch.ones(channels))
+
+    def effective_weight(self):
+        """(channels, n_offsets) weights w(d) actually applied."""
+        if self.norm != "l1":
+            return self.weight
+        return self.gain[:, None] * self.weight / self.weight.abs().sum(1, keepdim=True).clamp_min(1e-12)
 
     def forward(self, x):
         if x.ndim != 4 or x.shape[1] != self.channels:
@@ -227,7 +244,7 @@ class DiscFFTConv2d(nn.Module):
             x = x.float()
         # Correlation y(r) = sum_d w(d) x(r+d) is the convolution with kappa(-d) = w(d).
         kernel = x.new_zeros(self.channels, h, w)
-        kernel[:, (-self.offsets[:, 0]) % h, (-self.offsets[:, 1]) % w] = self.weight.to(x.dtype)
+        kernel[:, (-self.offsets[:, 0]) % h, (-self.offsets[:, 1]) % w] = self.effective_weight().to(x.dtype)
         spectrum = torch.fft.rfft2(x) * torch.fft.rfft2(kernel)
         return torch.fft.irfft2(spectrum, s=(h, w))
 
@@ -251,10 +268,12 @@ class MultiPathIntegral2d(nn.Module):
 
     ``disc_pathways=D`` makes the last D pathways use a depthwise disc kernel of
     ``disc_radius`` cells (DiscFFTConv2d: compact in space, every Fourier mode)
-    instead of the Fourier one (global, ``modes`` lowest modes only).
+    instead of the Fourier one (global, ``modes`` lowest modes only); ``disc_norm``
+    is its weight normalization ("" or "l1", see DiscFFTConv2d).
     """
 
-    def __init__(self, width, modes, pathways=1, groups=1, share="", disc_radius=None, disc_pathways=0):
+    def __init__(self, width, modes, pathways=1, groups=1, share="", disc_radius=None, disc_pathways=0,
+                 disc_norm=""):
         super().__init__()
         self.width = _integer("width", width)
         self.pathways = _integer("pathways", pathways)
@@ -275,7 +294,9 @@ class MultiPathIntegral2d(nn.Module):
             self.kernel = GroupedSpectralConv2d(width * spectral, modes, groups * spectral)
         else:
             self.kernel = None
-        self.disc = DiscFFTConv2d(width * disc_pathways, disc_radius) if disc_pathways else None
+        if disc_norm and not disc_pathways:
+            raise ValueError("disc_norm needs disc pathways")
+        self.disc = DiscFFTConv2d(width * disc_pathways, disc_radius, disc_norm) if disc_pathways else None
 
     def factors(self, state, forcing):
         """Source gates, receiver gates, and transmitted values, all (B,R*C,H,W), pathway-major."""
@@ -320,16 +341,16 @@ class IntegralUpdate(nn.Module):
     """
 
     def __init__(self, width, modes, step_size, radius=None, rank=None, gate_mode="full",
-                 pathways=1, kernel_groups=1, share="", disc_radius=None, disc_pathways=0):
+                 pathways=1, kernel_groups=1, share="", disc_radius=None, disc_pathways=0, disc_norm=""):
         super().__init__()
         self.step_size = step_size
-        if (pathways, kernel_groups, share, disc_pathways) == (1, 1, "", 0):
+        if (pathways, kernel_groups, share, disc_pathways, disc_norm) == (1, 1, "", 0, ""):
             self.interaction = StateDependentIntegral2d(width, modes, radius, rank, gate_mode)
         else:
             if radius is not None or gate_mode != "full":
                 raise ValueError("multi-pathway interactions are spectral with gate_mode='full'")
             self.interaction = MultiPathIntegral2d(width, modes, pathways, kernel_groups, share,
-                                                   disc_radius, disc_pathways)
+                                                   disc_radius, disc_pathways, disc_norm)
         self.proposal = nn.Conv2d((2 + pathways) * width, width, 1)
 
     def forward(self, state, forcing):
@@ -358,18 +379,18 @@ class RhizomeOperator2d(_RecurrentField2d):
     ``radius`` (cells) swaps in the compact real-space kernel; ``modes`` is then unused.
     ``gate_mode`` selects a gate ablation (see StateDependentIntegral2d); "frozen"
     relies on the initial state being tanh(forcing), as here.
-    ``pathways`` / ``kernel_groups`` / ``share`` / ``disc_radius`` / ``disc_pathways``
-    select MultiPathIntegral2d.
+    ``pathways`` / ``kernel_groups`` / ``share`` / ``disc_radius`` / ``disc_pathways`` /
+    ``disc_norm`` select MultiPathIntegral2d.
     """
 
     def __init__(self, in_channels, out_channels=1, scalar_dim=0, width=24, modes=6,
                  n_steps=6, step_size=0.5, untied=False, radius=None, rank=None, gate_mode="full",
-                 pathways=1, kernel_groups=1, share="", disc_radius=None, disc_pathways=0):
+                 pathways=1, kernel_groups=1, share="", disc_radius=None, disc_pathways=0, disc_norm=""):
         super().__init__(
             in_channels, out_channels, scalar_dim, width, modes, n_steps, step_size, untied,
             partial(IntegralUpdate, radius=radius, rank=rank, gate_mode=gate_mode,
                     pathways=pathways, kernel_groups=kernel_groups, share=share,
-                    disc_radius=disc_radius, disc_pathways=disc_pathways),
+                    disc_radius=disc_radius, disc_pathways=disc_pathways, disc_norm=disc_norm),
         )
 
 
