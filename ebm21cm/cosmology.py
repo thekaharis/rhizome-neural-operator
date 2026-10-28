@@ -81,7 +81,8 @@ class FlatLCDM:
         x, weight = np.polynomial.legendre.leggauss(order)
         half, mid = 0.5 * (z2 - z1), 0.5 * (z2 + z1)
         inv_e = 1.0 / self._e(mid[..., None] + half[..., None] * x)
-        return half * (inv_e @ weight) * C_KM_S / (100.0 * self.h)
+        # Elementwise sum, not a matrix product: the same z pair gives the same bits whatever the array shape.
+        return half * (inv_e * weight).sum(-1) * C_KM_S / (100.0 * self.h)
 
     def z_at_distance(self, d) -> np.ndarray:
         d = np.asarray(d, dtype=np.float64)

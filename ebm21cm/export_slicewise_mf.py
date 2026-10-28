@@ -165,7 +165,8 @@ def main(argv=None):
     def row_w(row):
         if node is None:
             return None
-        return node_weight(dataset.redshifts[row], float(dataset.params[row][omm]), node["w_mode"])
+        d = np.asarray(dataset.distances[row], dtype=np.float64)
+        return node_weight(dataset.redshifts[row], float(dataset.params[row][omm]), node["w_mode"], los_distance=d - d[0])
     # Sample ids come from the file names (mirror row != sample id after row 72), as in export_cubes3d.
     row_of = {int(re.findall(r"\d+", Path(dataset.file_paths[r]).stem)[-1]): int(r) for r in rows["test"]}
 

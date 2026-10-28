@@ -76,8 +76,11 @@ def main(argv=None):
             ref_d = {key: d[key] for key in ("truth", "tb_truth", "density", "z_native")}
         z = np.asarray(dataset.redshifts[row])
         pick = np.abs(z[None, :] - ref_d["z_native"][:, None]).argmin(axis=1)
-        w = None if node is None else node_weight(z, float(dataset.params[row][param_names.index("OMm")]),
-                                                   node["w_mode"])
+        w = None
+        if node is not None:
+            d = np.asarray(dataset.distances[row], dtype=np.float64)
+            w = node_weight(z, float(dataset.params[row][param_names.index("OMm")]), node["w_mode"],
+                            los_distance=d - d[0])
         inp = slice_inputs(dataset, row, np.arange(len(z)), head, LOSWindowConfig, bands, ip, wide=wide, w=w)
         n = len(z)
         x = np.empty((n, *inp["cond"].shape[-2:]), np.float32)

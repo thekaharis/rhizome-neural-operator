@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from ebm21cm.cosmology import FlatLCDM
-from ebm21cm.data.lightcone import NODE_REDSHIFTS, node_weight
+from ebm21cm.data.lightcone import LC_CELL_MPC, LC_Z_MIN, NODE_REDSHIFTS, node_weight
 from ebm21cm.data.mf_slices import SCHEMA, MFMemorySplit
 from ebm21cm.model.rhizome import build_model
 from ebm21cm.train_rhizome_mf2d import MFConfig, evaluate, node_output, node_scalars, run, two_node_output
@@ -37,6 +37,15 @@ def test_chi_weight_matches_tabulated_distances_and_z_weight_to_first_order():
     fine_nodes = 5.0 * 1.002 ** np.arange(1001) - 1.0
     fine = np.abs(node_weight(z, 0.27, nodes=fine_nodes) - node_weight(z, 0.27, "z", nodes=fine_nodes)).max()
     assert 1e-3 < coarse < 4e-3 and 0.08 < fine / coarse < 0.12
+
+
+def test_chi_weight_on_the_distance_grid_matches_chi_of_exact_redshifts():
+    cosmo = FlatLCDM(0.33, 0.6766)
+    los = np.arange(0, 2000, 7) * LC_CELL_MPC
+    z = cosmo.z_at_distance(cosmo.comoving_distance(LC_Z_MIN) + los)
+    assert np.abs(node_weight(z, 0.33, los_distance=los) - node_weight(z, 0.33)).max() < 1e-5
+    # A redshift error of 1e-3 moves chi(z) but not the distance-grid weight.
+    assert np.abs(node_weight(z + 1e-3, 0.33, los_distance=los) - node_weight(z, 0.33, los_distance=los)).max() == 0
 
 
 def test_node_weight_per_slice_omega_m():
@@ -110,7 +119,10 @@ def write_mf_cache(path, n_cones=6, per_cone=4, hw=8, n_cond=3, seed=0):
     stats = {"omm_mean": 0.3, "omm_std": 0.05}
     names = ["1/(1+z)", "OMm", "x_HI_global(0, 1)"]
     omm = np.repeat(rng.uniform(0.22, 0.38, n_cones), per_cone)
-    z = rng.uniform(6.0, 12.0, n)
+    los = rng.integers(100, 800, n)
+    z = np.concatenate([FlatLCDM(om, 0.6766).z_at_distance(FlatLCDM(om, 0.6766).comoving_distance(LC_Z_MIN)
+                                                            + los[k:k + per_cone] * LC_CELL_MPC)
+                        for k, om in zip(range(0, n, per_cone), omm[::per_cone])])
     xhi = rng.uniform(0, 1, (n, hw, hw))
     with h5py.File(path, "w") as h:
         h["cond"] = rng.normal(size=(n, n_cond, hw, hw)).astype(np.float16)
@@ -119,20 +131,23 @@ def write_mf_cache(path, n_cones=6, per_cone=4, hw=8, n_cond=3, seed=0):
         h["tb"] = rng.normal(size=(n, hw, hw)).astype(np.float16)
         h["scalars"] = np.stack([1 / (1 + z), (omm - 0.3) / 0.05, xhi.mean((1, 2))], 1).astype(np.float32)
         h["z"] = z
-        h["los_index"] = np.arange(n, dtype=np.int32)
+        h["los_index"] = los.astype(np.int32)
         h["cone_id"] = np.repeat(np.arange(n_cones), per_cone)
         h["split"] = np.repeat(np.array([0, 0, 0, 0, 1, 2][:n_cones], np.int8), per_cone)
         h.attrs.update({"schema": SCHEMA, "scalar_names": json.dumps(names),
                         "structured": json.dumps({"stats": stats}),
                         "normalization": json.dumps({"brightness_temp": {"offset": -20.0, "scale": 50.0}})})
-    return omm, z
+    return omm, z, los
 
 
-def test_memory_split_node_phase_is_computed_from_stored_z_and_omega_m(tmp_path):
-    omm, z = write_mf_cache(tmp_path / "mf.h5")
+def test_memory_split_node_phase_is_computed_from_the_cache(tmp_path):
+    omm, z, los = write_mf_cache(tmp_path / "mf.h5")
     split = MFMemorySplit(tmp_path / "mf.h5", "train", w_mode="chi")
-    expect = node_weight(z[:16], omm[:16])
-    assert np.allclose(split.w.numpy(), expect, atol=1e-6)
+    expect = node_weight(z[:16], omm[:16], los_distance=los[:16] * LC_CELL_MPC)
+    assert np.allclose(split.w.numpy(), expect, rtol=0, atol=1e-6)
+    assert np.allclose(split.w.numpy(), node_weight(z[:16], omm[:16]), rtol=0, atol=1e-5)
+    assert np.allclose(MFMemorySplit(tmp_path / "mf.h5", "train", w_mode="z").w.numpy(),
+                       node_weight(z[:16], mode="z"), rtol=0, atol=1e-6)
     assert torch.equal(split.batch([3, 1])["w"], split.w[[3, 1]])
     assert "w" not in MFMemorySplit(tmp_path / "mf.h5", "train").batch([0])
 

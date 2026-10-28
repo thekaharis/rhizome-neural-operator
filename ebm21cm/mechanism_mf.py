@@ -45,7 +45,7 @@ import h5py
 import numpy as np
 import torch
 
-from .data.lightcone import node_weight
+from .data.lightcone import LC_CELL_MPC, node_weight
 from .data.mf_slices import cache_omega_m
 from .model.rhizome import MultiPathIntegral2d, RhizomeOperator2d
 from .train_rhizome_mf2d import node_output, node_scalars
@@ -141,7 +141,7 @@ def main(argv=None):
 
     with h5py.File(a.cache or meta["cache"], "r") as h:
         rows = a.rows or pick_rows(h, a.split, a.targets)
-        data = [{k: h[k][r] for k in ("cond", "scalars", "xhi", "z", "cone_id")} for r in rows]
+        data = [{k: h[k][r] for k in ("cond", "scalars", "xhi", "z", "cone_id", "los_index")} for r in rows]
     K = None
     plt.rcParams.update({"font.size": 8, "axes.titlesize": 8, "axes.linewidth": 0.5, "mathtext.fontset": "cm"})
     for row, d in zip(rows, data):
@@ -152,7 +152,8 @@ def main(argv=None):
         w = None
         if node is not None:
             omm = cache_omega_m(d["scalars"][None], meta["cache_attrs"])
-            w = torch.from_numpy(node_weight(np.atleast_1d(d["z"]), omm, node["w_mode"]))
+            w = torch.from_numpy(node_weight(np.atleast_1d(d["z"]), omm, node["w_mode"],
+                                             los_distance=np.atleast_1d(d["los_index"]) * LC_CELL_MPC))
         scal = node_scalars(scal, w, node)
         truth = d["xhi"].astype(np.float64)
         with torch.no_grad():

@@ -43,33 +43,44 @@ DEFAULT_PARAM_NAMES = (
 # suite (all 6,600 raw files' lightcone/node_redshifts agree to 2e-14; hlittle = 0.6766 in all of them).
 NODE_REDSHIFTS = 5.0 * 1.02 ** np.arange(101) - 1.0
 HLITTLE = 0.6766
+# Every cone's LOS grid is uniform in comoving distance from chi(5): one 200/140 Mpc cell per index.
+LC_Z_MIN, LC_CELL_MPC = 5.0, 200.0 / 140
 W_MODES = ("chi", "z")
 
 
-def node_weight(z, omega_m=None, mode="chi", nodes=NODE_REDSHIFTS, h=HLITTLE):
+def node_weight(z, omega_m=None, mode="chi", nodes=NODE_REDSHIFTS, h=HLITTLE, los_distance=None):
     """Interpolation weight w in [0, 1) of lightcone slices between their two bracketing coeval nodes.
 
     21cmFAST builds a slice at z_b < z <= z_a (a: the earlier, higher-z node) as x = (1 - w) X_a + w X_b, so w = 0
     at node a and w -> 1 towards node b. ``mode="chi"``: linear in comoving distance,
-    w = (chi(z_a) - chi(z)) / (chi(z_a) - chi(z_b)), with the cone's ``omega_m`` (scalar or one per slice) and ``h``
+    w = (chi(z_a) - chi) / (chi(z_a) - chi(z_b)), with the cone's ``omega_m`` (scalar or one per slice) and ``h``
     (c/H0 cancels; h only sets the radiation density); ``mode="z"``: linear in redshift. Outside the node range
     w is clipped to [0, 1].
+
+    ``los_distance`` (Mpc, one per slice): the slices' comoving distance from the cone's first slice at
+    ``LC_Z_MIN``, i.e. 21cmFAST's own distance grid, used for chi (nodes are bracketed on it too). Without it chi
+    is chi(z) of the stored redshifts, which are inverted from that grid only to ~1e-3 (w off by up to 0.0023).
     """
     if mode not in W_MODES:
         raise ValueError(f"w mode must be one of {W_MODES}")
     z = np.asarray(z, dtype=np.float64)
     zn = np.sort(np.asarray(nodes, dtype=np.float64))
-    i = np.clip(np.searchsorted(zn, z, side="left"), 1, len(zn) - 1)
-    z_a, z_b = zn[i], zn[i - 1]
+
+    def interpolate(position, node_position):
+        i = np.clip(np.searchsorted(node_position, position, side="left"), 1, len(zn) - 1)
+        return np.clip((node_position[i] - position) / (node_position[i] - node_position[i - 1]), 0.0, 1.0)
+
     if mode == "z":
-        return np.clip((z_a - z) / (z_a - z_b), 0.0, 1.0)
+        return interpolate(z, zn)
     omega_m = np.broadcast_to(np.asarray(omega_m, dtype=np.float64), z.shape)
     w = np.empty_like(z)
     for om in np.unique(omega_m):
         sel = omega_m == om
         cosmo = FlatLCDM(om, h)
-        w[sel] = cosmo.distance_between(z[sel], z_a[sel]) / cosmo.distance_between(z_b[sel], z_a[sel])
-    return np.clip(w, 0.0, 1.0)
+        chi = cosmo.distance_between(LC_Z_MIN, z[sel]) if los_distance is None else \
+            np.broadcast_to(np.asarray(los_distance, dtype=np.float64), z.shape)[sel]
+        w[sel] = interpolate(chi, cosmo.distance_between(LC_Z_MIN, zn))  # distances from chi(LC_Z_MIN)
+    return w
 
 
 def _scalar(v):

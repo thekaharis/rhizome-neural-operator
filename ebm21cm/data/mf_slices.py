@@ -34,7 +34,7 @@ import numpy as np
 import torch
 
 from .cache import DEFAULT_BANDS, band_extent, parse_bands, pick_window_indices
-from .lightcone import node_weight
+from .lightcone import LC_CELL_MPC, node_weight
 from .memory import _runs, dihedral
 
 SCHEMA = "ebm21cm-mfslices-v1"
@@ -234,7 +234,7 @@ class MFMemorySplit:
     (B, 2, H, W: x_HI and normalized T_b) and ``phys`` (B, 1, H, W, mK), with
     one transverse dihedral element per sample applied to every field alike.
     With ``w_mode`` ("chi" or "z", see ``lightcone.node_weight``) it also returns
-    each slice's node phase ``w`` (B,), computed from the stored z and Omega_m.
+    each slice's node phase ``w`` (B,), computed from the stored z, LOS index and Omega_m.
     """
 
     def __init__(self, path, split, storage="cpu", device="cpu", block_rows=256, w_mode=None):
@@ -255,13 +255,15 @@ class MFMemorySplit:
                     pos += b - a
             self.scalars = torch.from_numpy(h["scalars"][:][rows].astype(np.float32)).to(self.storage)
             self.z, self.cone_id, self.rows = h["z"][:][rows], h["cone_id"][:][rows], rows
+            self.los_index = h["los_index"][:][rows]
         self.cond, self.phys, self.xhi, self.tb = (torch.from_numpy(arrays[k]).to(self.storage)
                                                    for k in ("cond", "phys", "xhi", "tb"))
         self._z_t = torch.from_numpy(self.z.astype(np.float64))
         self._cone_t = torch.from_numpy(self.cone_id.astype(np.int64))
         self.w = None
         if w_mode:
-            w = node_weight(self.z, cache_omega_m(self.scalars.cpu().numpy(), self.attrs), w_mode)
+            w = node_weight(self.z, cache_omega_m(self.scalars.cpu().numpy(), self.attrs), w_mode,
+                            los_distance=self.los_index * LC_CELL_MPC)
             self.w = torch.from_numpy(w.astype(np.float32)).to(self.storage)
 
     def __len__(self):
