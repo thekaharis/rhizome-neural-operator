@@ -28,8 +28,11 @@ the summary reports every metric on the remaining rectangular crop.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import pickle
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -190,14 +193,64 @@ def borders(keep):
     return int(min(row, col))
 
 
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _code_commit():
+    try:
+        root = Path(__file__).resolve().parents[1]
+        commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"],
+                                         text=True, stderr=subprocess.DEVNULL).strip()
+        dirty = subprocess.check_output(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
+                                        text=True, stderr=subprocess.DEVNULL).strip() != ""
+        return commit, dirty
+    except Exception:
+        return "unknown", True
+
+
 def fingerprint(args, best):
-    """Config signature stored with each cone so a resume cannot mix selections."""
-    return {"run": str(args.run.resolve()), "step": best.get("step"), "cache": str(args.cache.resolve()),
+    """Complete config signature stored with each cone so a resume cannot mix runs."""
+    commit, dirty = _code_commit()
+    return {"run": str(args.run.resolve()), "step": best.get("step"),
+            "checkpoint_sha256": _sha256(args.run / "best.pt"),
+            "data": str(args.data.resolve()), "cache": str(args.cache.resolve()),
             "l_perp": args.l_perp, "border": args.border, "los_margin": args.los_margin,
             "slice_stride": args.slice_stride, "min_per_stage": args.min_per_stage,
+            "shape_per_stage": args.shape_per_stage, "baseline_per_stage": args.baseline_per_stage,
+            "no_baselines": bool(args.no_baselines),
             "density_mean": args.density_mean, "velocity": args.velocity,
+            "device": str(torch.device(args.device)),
+            "torch_inputs": bool(args.force_torch_inputs or torch.device(args.device).type != "cpu"),
             "n_native": args.n_native, "n_los": args.n_los,
-            "z_range": list(args.z_range), "z_window": list(args.z_window) if args.z_window else None}
+            "z_range": list(args.z_range), "z_window": list(args.z_window) if args.z_window else None,
+            "ids": None if not args.ids else sorted(int(i) for i in args.ids), "limit": args.limit,
+            "code_commit": commit, "code_dirty": bool(dirty)}
+
+
+def load_completed(out, fp):
+    """(totals, records, done sims) from valid pickles; corrupt/partial pickles are removed for recompute."""
+    totals = {name: Accumulator() for name, _, _ in lm.STAGES}
+    records, done = [], set()
+    for pkl in sorted(Path(out).glob("cone_*.pkl")):
+        try:
+            payload = pickle.loads(pkl.read_bytes())
+            if not isinstance(payload, dict) or "fingerprint" not in payload or "stages" not in payload:
+                raise ValueError("incomplete pickle")
+        except Exception:
+            pkl.unlink(missing_ok=True)
+            continue
+        if payload["fingerprint"] != fp:
+            raise SystemExit(f"{pkl}: resume config differs from this command; use a fresh --out")
+        for name in totals:
+            totals[name].merge(payload["stages"][name])
+        records.append(payload["record"])
+        done.add(int(payload["record"]["sim"]))
+    return totals, records, done
 
 
 def select_targets(adapter, cone, truth_x, stride, min_per_stage):
@@ -262,8 +315,8 @@ def main(argv=None):
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--force-torch-inputs", action="store_true",
                     help="debug: run the torch input path even on CPU (it is implied by --device cuda)")
-    ap.add_argument("--shape-per-stage", type=int, default=48,
-                    help="slices per stage for bubble/front/PDF/curve metrics (0 = all)")
+    ap.add_argument("--shape-per-stage", type=int, default=0,
+                    help="slices per stage for bubble/front/PDF/curve metrics; 0 = all active slices (production)")
     ap.add_argument("--baseline-per-stage", type=int, default=32,
                     help="slices per stage for the excursion-set baseline (0 = all shape slices)")
     ap.add_argument("--no-baselines", action="store_true")
@@ -294,14 +347,7 @@ def main(argv=None):
     totals = {name: Accumulator() for name, _, _ in lm.STAGES}
     per_cone = []
     if args.resume:
-        for pkl in sorted(args.out.glob("cone_*.pkl")):
-            payload = pickle.loads(pkl.read_bytes())
-            if payload.get("fingerprint") != fp:
-                raise SystemExit(f"{pkl}: resume config differs from this command; use a fresh --out")
-            for name in totals:
-                totals[name].merge(payload["stages"][name])
-            per_cone.append(payload["record"])
-        done = {int(r["sim"]) for r in per_cone}
+        totals, per_cone, done = load_completed(args.out, fp)
         files = [p for p in files if int(p.stem.split("simu")[-1]) not in done]
         print(f"resume: {len(per_cone)} cones already done, {len(files)} to go", flush=True)
     print(f"{len(files)} cones to evaluate, {len(stats['bands'])} bands, checkpoint step {best.get('step')}; "
@@ -362,7 +408,8 @@ def main(argv=None):
                 stages[stage].add_slice(pred_x[i, crop, crop], true, pred_tb[i, crop, crop],
                                         truth_tb[crop, crop, i], cone.l_perp / cone.n_native)
             for name, idx in active.items():
-                for i in select(idx, args.shape_per_stage):
+                shape_idx = idx if args.shape_per_stage <= 0 else select(idx, args.shape_per_stage)
+                for i in shape_idx:
                     true = truth_x[crop, crop, i]
                     stages[name].add_shape(pred_x[i, crop, crop], true, pred_tb[i, crop, crop],
                                            truth_tb[crop, crop, i], cone.l_perp / cone.n_native)
@@ -384,6 +431,11 @@ def main(argv=None):
                       "slice_stride": args.slice_stride, "min_per_stage": args.min_per_stage,
                       "n_valid": int(cone.n_slices), "n_predicted": int(predicted.sum()),
                       "n_edge_excluded": len(edge), "n_targets": None if targets is None else int(len(targets)),
+                      "shape_per_stage": args.shape_per_stage, "baseline_per_stage": args.baseline_per_stage,
+                      "no_baselines": bool(args.no_baselines),
+                      "z_window": list(args.z_window) if args.z_window else None,
+                      "device": str(device), "torch_inputs": bool(adapter.torch_inputs),
+                      "code_commit": fp["code_commit"], "code_dirty": fp["code_dirty"],
                       "scalars": {"histories": "oracle (cone's own x_HI/T_b band means)",
                                   "parameters": "training mean (normalized zero)"},
                       "n_active": {name: len(idx) for name, idx in active.items()},
@@ -402,8 +454,9 @@ def main(argv=None):
                                     "border": args.border, "los_margin": args.los_margin,
                                     "slice_stride": args.slice_stride, "grid": "native 128, increasing z"})
             target.write_text(json.dumps(record, indent=1))
-            pickle.dump({"fingerprint": fp, "record": record, "stages": stages},
-                        (args.out / f"cone_{sim}.pkl").open("wb"))
+            tmp = args.out / f".cone_{sim}.pkl.tmp"
+            tmp.write_bytes(pickle.dumps({"fingerprint": fp, "record": record, "stages": stages}))
+            os.replace(tmp, args.out / f"cone_{sim}.pkl")
             per_cone.append(record)
             for name in totals:
                 totals[name].merge(stages[name])
@@ -412,17 +465,43 @@ def main(argv=None):
                               f"rmse={record['stages'][name]['xhi_rmse']['0.0']:.4f} "
                               f"iou={record['stages'][name]['iou_matched']:.3f}" for name in stages), flush=True)
 
+    stages = {}
+    for name in totals:
+        entry = totals[name].metrics()
+        entry.pop("front_width_pred_mpc", None)
+        entry.pop("front_width_true_mpc", None)
+        entry.update(front_stats(per_cone, name))
+        stages[name] = entry
     summary = {"run": str(args.run.resolve()), "data": str(args.data.resolve()), "cache": str(args.cache.resolve()),
                "checkpoint_step": best.get("step"), "l_perp": args.l_perp, "density_mean": args.density_mean,
                "velocity": args.velocity, "border": args.border, "los_margin": args.los_margin,
                "slice_stride": args.slice_stride, "min_per_stage": args.min_per_stage,
+               "shape_per_stage": args.shape_per_stage, "baseline_per_stage": args.baseline_per_stage,
+               "no_baselines": bool(args.no_baselines),
+               "device": str(device), "torch_inputs": bool(args.force_torch_inputs or device.type != "cpu"),
+               "ids": None if not args.ids else sorted(int(i) for i in args.ids), "limit": args.limit,
+               "z_window": list(args.z_window) if args.z_window else None,
                "n_cones": len(per_cone),
                "scalars": {"histories": "oracle (cone's own x_HI/T_b band means)",
                            "parameters": "training mean (normalized zero)"},
-               "stages": {name: totals[name].metrics() for name in totals}}
+               "stages": stages}
     (args.out / "summary.json").write_text(json.dumps({"summary": summary, "cones": per_cone}, indent=1))
     write_markdown(args.out / "summary.md", summary)
     print(f"wrote {args.out / 'summary.json'}", flush=True)
+
+
+def front_stats(records, stage):
+    """Median finite front width per stage over cones, plus the number of NaN/missing cones (never imputed)."""
+    pred = [r["stages"].get(stage, {}).get("front_width_pred_mpc", float("nan")) for r in records]
+    true = [r["stages"].get(stage, {}).get("front_width_true_mpc", float("nan")) for r in records]
+    def median(values):
+        finite = [float(v) for v in values if np.isfinite(v)]
+        return float(np.median(finite)) if finite else float("nan")
+    return {"front_width_pred_mpc_median": median(pred),
+            "front_width_true_mpc_median": median(true),
+            "front_width_pred_nan_cones": int(sum(not np.isfinite(v) for v in pred)),
+            "front_width_true_nan_cones": int(sum(not np.isfinite(v) for v in true)),
+            "front_width_n_cones": len(records)}
 
 
 def write_markdown(path, summary):
@@ -435,15 +514,18 @@ def write_markdown(path, summary):
              "Scalars are the cone's own (oracle) histories and the training-mean parameters; the numbers are therefore "
              "a history-conditioned upper bound, not a parameter-marginalized score. The first/last `--los-margin` "
              "slices use edge-replicated LOS bands.",
-             "", "| stage | n | x_HI RMSE | 2.3 Mpc | 4.7 Mpc | IoU | T_b RMSE [mK] | T_b PDF W1 | bubble W1 (0.5) | front width pred/truth [Mpc] |",
+             f"shape slices = {'all active' if summary['shape_per_stage'] <= 0 else summary['shape_per_stage']} per stage, "
+             f"baselines = {summary['baseline_per_stage']} per stage",
+             "", "| stage | n | x_HI RMSE | 2.3 Mpc | 4.7 Mpc | IoU | T_b RMSE [mK] | T_b PDF W1 | bubble W1 (0.5) | front width pred/truth [Mpc] (NaN cones) |",
              "|---|---|---|---|---|---|---|---|---|---|"]
     for name, _, _ in lm.STAGES:
         m = summary["stages"][name]
         lines.append(f"| {name} | {m['n_slices']} | {m['xhi_rmse']['0.0']:.4f} | {m['xhi_rmse']['2.3']:.4f} | "
                      f"{m['xhi_rmse']['4.7']:.4f} | {m['iou_matched']:.3f} | {m['tb_rmse_mk']:.2f} | "
                      f"{m['tb_pdf_w1']:.3f} | {m['bubble_w1_0.5']:.3f} | "
-                     f"{m.get('front_width_pred_mpc', float('nan')):.2f} / "
-                     f"{m.get('front_width_true_mpc', float('nan')):.2f} |")
+                     f"{m.get('front_width_pred_mpc_median', float('nan')):.2f} / "
+                     f"{m.get('front_width_true_mpc_median', float('nan')):.2f} "
+                     f"({m.get('front_width_pred_nan_cones', 0)}) |")
     lines += ["", "| stage | density IoU | density RMSE | excursion-set IoU | excursion-set RMSE |",
               "|---|---|---|---|---|"]
     for name, _, _ in lm.STAGES:

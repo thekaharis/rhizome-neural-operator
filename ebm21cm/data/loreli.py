@@ -24,6 +24,7 @@ training code changes.
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -119,6 +120,9 @@ def resample_transverse_torch(plane, n_out, device="cuda"):
 
 def band_planes_torch(values, centers, bands):
     """GPU/torch version of :func:`band_planes`; ``values`` is (H, W, n) and float64 cumsum is kept."""
+    if max(centers) + max(hi for _, hi in bands) > values.shape[-1] or \
+            min(centers) + min(lo for lo, _ in bands) < 0:
+        raise ValueError("band lies outside the LOS axis")
     csum = torch.cumsum(values.to(torch.float64), -1)
     csum = torch.cat([torch.zeros(values.shape[:2] + (1,), dtype=torch.float64, device=values.device), csum], -1)
     lo = torch.tensor([b[0] for b in bands], device=values.device)
@@ -201,9 +205,9 @@ def velocity_shape_torch(delta, cell=TRAINING_CELL_MPC, cell_los=None, device="c
     d = torch.as_tensor(delta, dtype=torch.float32, device=device)
     ny, nx, nz = d.shape
     cell_los = cell if cell_los is None else cell_los
-    kx = 2 * torch.pi * torch.fft.fftfreq(ny, d=cell, device=device)
-    ky = 2 * torch.pi * torch.fft.fftfreq(nx, d=cell, device=device)
-    kz = 2 * torch.pi * torch.fft.rfftfreq(nz, d=cell_los, device=device)
+    kx = 2 * math.pi * torch.fft.fftfreq(ny, d=cell, device=device)
+    ky = 2 * math.pi * torch.fft.fftfreq(nx, d=cell, device=device)
+    kz = 2 * math.pi * torch.fft.rfftfreq(nz, d=cell_los, device=device)
     k2 = (kx[:, None, None] ** 2 + ky[None, :, None] ** 2 + kz[None, None, :] ** 2).to(torch.float32)
     k2[0, 0, 0] = 1.0
     spectrum = torch.fft.rfftn(d)
@@ -394,7 +398,7 @@ class LoreliAdapter:
         first, last = np.flatnonzero(self.cone.valid)[[0, -1]]
         lo, hi = max(0, first - self.halo), min(self.cone.n_los, last + self.halo + 1)
         dense = self.cone.delta(self.cone.read(lo, hi, fields=("dens",))["dens"])
-        if self.device.type == "cuda":
+        if self.torch_inputs:
             shape = velocity_shape_torch(dense, cell=self.l_perp / self.cone.n_native,
                                          cell_los=float(np.median(np.diff(self.cone.distances))),
                                          device=self.device)

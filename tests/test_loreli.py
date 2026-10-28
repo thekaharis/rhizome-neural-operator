@@ -1,4 +1,6 @@
 import json
+import pickle
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -6,11 +8,20 @@ import pytest
 import torch
 
 from ebm21cm import loreli_metrics as lm
-from ebm21cm.data.loreli import (LoreliAdapter, LoreliCone, band_planes, linear_velocity, loreli_redshifts,
-                                 mirror_pad, pad_to, resample_transverse, training_stats)
+from ebm21cm.data.loreli import (LoreliAdapter, LoreliCone, band_planes, band_planes_torch, linear_velocity,
+                                 loreli_redshifts, mirror_pad, pad_to, read_cube, resample_transverse,
+                                 training_stats, velocity_shape, velocity_shape_torch)
+from ebm21cm.evaluate_loreli import Accumulator, fingerprint, load_completed
 from ebm21cm.loreli_inference import area_matrix, downsample_transverse, load_model, map_to_native
 from ebm21cm.model.remap import remapped_model, remap_spectral_conv
 from ebm21cm.model.rhizome import build_model
+
+REAL_STATS = {"bands": [(-32, -16), (-16, -8), (-8, -4), (-3, -2), (-2, -1), (-1, 0), (0, 1), (1, 2),
+                        (2, 3), (3, 4), (4, 8), (8, 16), (16, 32)],
+              "normalization": {"density": {"offset": 0.0, "scale": 10.0},
+                                "los_velocity": {"offset": 0.0, "scale": 1e-17}},
+              "param_names": [f"p{i}" for i in range(11)],
+              "scalar_names": ["1/(1+z)"] + [f"p{i}" for i in range(11)] + [f"h{i}" for i in range(26)]}
 
 STATS = {"bands": [(-4, -2), (-1, 0), (0, 1), (2, 4)],
          "normalization": {"density": {"offset": 0.0, "scale": 10.0},
@@ -144,6 +155,72 @@ def test_torch_input_path_matches_the_numpy_path(tmp_path):
     assert np.allclose(numpy_inputs["cond"], torch_inputs["cond"].numpy(), atol=1e-5)
     assert np.allclose(numpy_inputs["phys"], torch_inputs["phys"].numpy(), atol=1e-5)
     assert np.allclose(numpy_inputs["scalars"], torch_inputs["scalars"], atol=1e-6)
+
+
+def test_linear_velocity_torch_matches_numpy_on_the_real_geometry(tmp_path):
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00007.dat"
+    write_cone(path, n_native=16, n_los=32, tail=4)
+    cone = LoreliCone(path, z_range=(5.0, 5.4), n_native=16, n_los=32)
+    numpy_adapter = LoreliAdapter(cone, REAL_STATS, velocity="linear", device="cpu")
+    torch_adapter = LoreliAdapter(cone, REAL_STATS, velocity="linear", device="cpu", force_torch=True)
+    assert numpy_adapter.n_out == 206 and numpy_adapter.domain == 280
+    assert numpy_adapter._vel_shape.shape == torch_adapter._vel_shape.shape
+    assert np.allclose(numpy_adapter._vel_shape, torch_adapter._vel_shape, atol=1e-5)
+    a = numpy_adapter.inputs(2, 5)
+    b = torch_adapter.inputs(2, 5)
+    assert a["cond"].shape == (3, 26, 280, 280)
+    assert np.allclose(a["cond"], b["cond"].numpy(), atol=1e-4)
+    assert np.allclose(a["phys"], b["phys"].numpy(), atol=1e-4)
+
+
+def test_read_cube_equality(tmp_path):
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00008.dat"
+    cube = write_cone(path, n_native=12, n_los=20, tail=0)
+    raw = read_cube(path)
+    assert np.array_equal(raw, cube.reshape(-1))
+    from_path = LoreliCone(path, z_range=(5.0, 5.2), n_native=12, n_los=20)
+    from_data = LoreliCone(path, z_range=(5.0, 5.2), n_native=12, n_los=20, data=raw)
+    assert np.array_equal(from_path.data, from_data.data)
+    assert np.array_equal(from_path.valid, from_data.valid)
+    assert np.allclose(from_path.history()[0], from_data.history()[0])
+
+
+def test_band_planes_torch_bounds_check():
+    values = torch.zeros(8, 8, 20)
+    with pytest.raises(ValueError):
+        band_planes_torch(values, np.array([18]), [(-1, 3)])
+    with pytest.raises(ValueError):
+        band_planes_torch(values, np.array([1]), [(-3, 0)])
+
+
+def _fingerprint_args(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "best.pt").write_bytes(b"checkpoint")
+    data = tmp_path / "data"
+    data.mkdir()
+    return SimpleNamespace(run=run, cache=tmp_path / "cache.h5", data=data, l_perp=294.0, border=4,
+                           los_margin=28, slice_stride=1, min_per_stage=8, shape_per_stage=0,
+                           baseline_per_stage=32, no_baselines=False, density_mean="slice", velocity="linear",
+                           device="cpu", force_torch_inputs=False, n_native=128, n_los=1536,
+                           z_range=(5.0, 15.0), z_window=None, ids=None, limit=None)
+
+
+def test_resume_fingerprint_and_partial_pickle(tmp_path):
+    args = _fingerprint_args(tmp_path)
+    fp = fingerprint(args, {"step": 1})
+    out = tmp_path / "out"
+    out.mkdir()
+    stages = {name: Accumulator() for name, _, _ in lm.STAGES}
+    record = {"sim": 1, "stages": {name: stages[name].metrics() for name in stages}}
+    (out / "cone_1.pkl").write_bytes(pickle.dumps({"fingerprint": fp, "record": record, "stages": stages}))
+    (out / "cone_2.pkl").write_bytes(b"partial")
+    totals, records, done = load_completed(out, fp)
+    assert done == {1} and len(records) == 1
+    assert not (out / "cone_2.pkl").exists()
+    args.device = "cuda"
+    with pytest.raises(SystemExit):
+        load_completed(out, fingerprint(args, {"step": 1}))
 
 
 def test_area_matrix_rows_sum_to_one():

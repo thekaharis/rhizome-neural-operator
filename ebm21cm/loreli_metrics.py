@@ -16,7 +16,7 @@ from scipy.stats import wasserstein_distance
 
 from . import metrics
 
-STAGES = (("early", 0.05, 0.35), ("mid", 0.35, 0.65), ("late", 0.65, 0.95))
+STAGES = (("xHI_0.05-0.35", 0.05, 0.35), ("xHI_0.35-0.65", 0.35, 0.65), ("xHI_0.65-0.95", 0.65, 0.95))
 FRONT_EDGES = np.arange(-12.0, 12.01, 1.0)
 
 
