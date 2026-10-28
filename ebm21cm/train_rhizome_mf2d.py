@@ -17,7 +17,8 @@ from the cache (the 3-D ``StructuredBrightness3d`` physics on one slice);
 
 Node phase (default off): w is the slice's 21cmFAST interpolation weight between its
 two coeval node boxes, x = (1 - w) X_a + w X_b (``data.lightcone.node_weight``,
-``--w-mode chi|z``). ``--node-phase-input`` appends w to the scalars.
+``--w-mode z|chi``, default z as the suite's cones confirm). ``--node-phase-input``
+appends w to the scalars.
 ``--two-node-head`` adds output channel 2, d: the decoder's logits l_a (channel 0)
 and l_b = l_a - softplus(d) (``--no-node-monotone``: l_b = d) give
 x = (1 - w) sigmoid(l_a) + w sigmoid(l_b), collapsed in log space to the x_HI logit
@@ -93,7 +94,7 @@ class MFConfig(LongRunConfig):
     node_phase_input: bool = False
     two_node_head: bool = False
     node_monotone: bool = True  # two-node head: l_b = l_a - softplus(d), a cell does not recombine between nodes
-    w_mode: str = "chi"         # "chi": w linear in comoving distance; "z": linear in redshift
+    w_mode: str = "z"           # "z" (21cmFAST's interpolation, confirmed on the suite): linear in redshift
 
 
 class PowerLoss(torch.nn.Module):
@@ -140,10 +141,10 @@ def scalar_keep(names, drop):
 
 def node_phase(config):
     """The checkpoint's node-phase settings, or None when neither node-phase option is on (the default)."""
-    if not (config.node_phase_input or config.two_node_head):
-        return None
     if config.w_mode not in W_MODES:
         raise ValueError(f"w_mode must be one of {W_MODES}")
+    if not (config.node_phase_input or config.two_node_head):
+        return None
     return {"w_mode": config.w_mode, "input": config.node_phase_input, "two_node": config.two_node_head,
             "monotone": config.node_monotone}
 

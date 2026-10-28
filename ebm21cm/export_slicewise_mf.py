@@ -24,9 +24,10 @@ import h5py
 import numpy as np
 import torch
 
+from .cosmology import FlatLCDM
 from .data.cache import band_extent
 from .data.mf_slices import FNO_ROOT, PREPARATION, band_means, fno_dataset
-from .data.lightcone import node_weight
+from .data.lightcone import HLITTLE, LC_CELL_MPC, LC_Z_MIN, node_weight
 from .model.rhizome import build_model
 from .train_rhizome_mf2d import node_output, node_scalars, tb_normalized
 
@@ -166,7 +167,14 @@ def main(argv=None):
         if node is None:
             return None
         d = np.asarray(dataset.distances[row], dtype=np.float64)
-        return node_weight(dataset.redshifts[row], float(dataset.params[row][omm]), node["w_mode"], los_distance=d - d[0])
+        om = float(dataset.params[row][omm])
+        start = d[0] - FlatLCDM(om, HLITTLE).comoving_distance(LC_Z_MIN)
+        step = np.abs(np.diff(d) - LC_CELL_MPC).max()
+        if abs(start) > 0.01 or step > 1e-3:
+            raise ValueError(f"cone row {row}: LOS grid starts {start:+.3f} Mpc from chi({LC_Z_MIN}) and its cell "
+                             f"step is off by {step:.2e} Mpc: not 21cmFAST's grid (wrong z_min, crop or box size), "
+                             f"so the node phase would be wrong")
+        return node_weight(dataset.redshifts[row], om, node["w_mode"], los_distance=d - d[0])
     # Sample ids come from the file names (mirror row != sample id after row 72), as in export_cubes3d.
     row_of = {int(re.findall(r"\d+", Path(dataset.file_paths[r]).stem)[-1]): int(r) for r in rows["test"]}
 

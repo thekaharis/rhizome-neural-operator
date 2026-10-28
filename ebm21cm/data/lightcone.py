@@ -48,18 +48,20 @@ LC_Z_MIN, LC_CELL_MPC = 5.0, 200.0 / 140
 W_MODES = ("chi", "z")
 
 
-def node_weight(z, omega_m=None, mode="chi", nodes=NODE_REDSHIFTS, h=HLITTLE, los_distance=None):
+def node_weight(z, omega_m=None, mode="z", nodes=NODE_REDSHIFTS, h=HLITTLE, los_distance=None):
     """Interpolation weight w in [0, 1) of lightcone slices between their two bracketing coeval nodes.
 
     21cmFAST builds a slice at z_b < z <= z_a (a: the earlier, higher-z node) as x = (1 - w) X_a + w X_b, so w = 0
-    at node a and w -> 1 towards node b. ``mode="chi"``: linear in comoving distance,
-    w = (chi(z_a) - chi) / (chi(z_a) - chi(z_b)), with the cone's ``omega_m`` (scalar or one per slice) and ``h``
-    (c/H0 cancels; h only sets the radiation density); ``mode="z"``: linear in redshift. Outside the node range
-    w is clipped to [0, 1].
+    at node a and w -> 1 towards node b. ``mode="z"`` (the default, and what the suite's cones show): linear in
+    redshift; ``mode="chi"``: linear in comoving distance, w = (chi(z_a) - chi) / (chi(z_a) - chi(z_b)), with the
+    cone's ``omega_m`` (scalar or one per slice) and ``h`` (c/H0 cancels; h only sets the radiation density).
+    Outside the node range w is clipped to [0, 1] (at or below the lowest node w = 1, i.e. that node's box).
 
     ``los_distance`` (Mpc, one per slice): the slices' comoving distance from the cone's first slice at
-    ``LC_Z_MIN``, i.e. 21cmFAST's own distance grid, used for chi (nodes are bracketed on it too). Without it chi
-    is chi(z) of the stored redshifts, which are inverted from that grid only to ~1e-3 (w off by up to 0.0023).
+    ``LC_Z_MIN``, i.e. 21cmFAST's own distance grid. Both modes then take the slice position from it (z mode: the
+    redshift at that distance) and bracket the nodes on it; it must agree with chi of the stored ``z`` to 0.5 Mpc
+    (a different start or cell size raises). Without it the stored redshifts are used, which are inverted from that
+    grid only to ~1e-3 (w off by up to 0.0023).
     """
     if mode not in W_MODES:
         raise ValueError(f"w mode must be one of {W_MODES}")
@@ -70,16 +72,24 @@ def node_weight(z, omega_m=None, mode="chi", nodes=NODE_REDSHIFTS, h=HLITTLE, lo
         i = np.clip(np.searchsorted(node_position, position, side="left"), 1, len(zn) - 1)
         return np.clip((node_position[i] - position) / (node_position[i] - node_position[i - 1]), 0.0, 1.0)
 
-    if mode == "z":
+    if mode == "z" and los_distance is None:
         return interpolate(z, zn)
     omega_m = np.broadcast_to(np.asarray(omega_m, dtype=np.float64), z.shape)
     w = np.empty_like(z)
     for om in np.unique(omega_m):
         sel = omega_m == om
         cosmo = FlatLCDM(om, h)
-        chi = cosmo.distance_between(LC_Z_MIN, z[sel]) if los_distance is None else \
-            np.broadcast_to(np.asarray(los_distance, dtype=np.float64), z.shape)[sel]
-        w[sel] = interpolate(chi, cosmo.distance_between(LC_Z_MIN, zn))  # distances from chi(LC_Z_MIN)
+        chi = cosmo.distance_between(LC_Z_MIN, z[sel])  # distances from chi(LC_Z_MIN)
+        if los_distance is not None:
+            grid = np.broadcast_to(np.asarray(los_distance, dtype=np.float64), z.shape)[sel]
+            if np.abs(grid - chi).max() > 0.5:
+                raise ValueError(f"LOS distance grid is {np.abs(grid - chi).max():.2f} Mpc off chi(z): not the "
+                                 f"suite's grid from z = {LC_Z_MIN} in {LC_CELL_MPC:.4f} Mpc cells")
+            chi = grid
+        if mode == "chi":
+            w[sel] = interpolate(chi, cosmo.distance_between(LC_Z_MIN, zn))
+        else:
+            w[sel] = interpolate(cosmo.z_beyond(LC_Z_MIN, chi, z[sel]), zn)
     return w
 
 
@@ -163,11 +173,6 @@ class Lightcone:
     @property
     def cell_size(self) -> float:
         return self.box_len / self.shape_hw[0]
-
-    @property
-    def node_redshifts(self) -> np.ndarray:
-        """The coeval node redshifts the cone was interpolated between (raw_v2 only), increasing."""
-        return np.sort(np.asarray(self._f["lightcone/node_redshifts"], dtype=np.float64))
 
     # ------------------------------------------------------------ params
     def _param_groups(self):

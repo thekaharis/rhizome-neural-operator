@@ -84,6 +84,13 @@ class FlatLCDM:
         # Elementwise sum, not a matrix product: the same z pair gives the same bits whatever the array shape.
         return half * (inv_e * weight).sum(-1) * C_KM_S / (100.0 * self.h)
 
+    def z_beyond(self, z1, d, z_guess, steps=3) -> np.ndarray:
+        """Redshift at comoving distance ``d`` (Mpc) beyond z1, by Newton steps from ``z_guess`` (no table)."""
+        z = np.array(z_guess, dtype=np.float64)
+        for _ in range(steps):
+            z = z - (self.distance_between(z1, z) - d) * self._e(z) * 100.0 * self.h / C_KM_S
+        return z
+
     def z_at_distance(self, d) -> np.ndarray:
         d = np.asarray(d, dtype=np.float64)
         z, dist = self._table

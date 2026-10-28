@@ -80,6 +80,8 @@ def pick_receivers(truth, n_front, n_interior, depth, rng):
 
 def analyse(run, slices, cache, args, device):
     best = torch.load(run / "best.pt", map_location="cpu", weights_only=False)
+    if best.get("node_phase"):
+        raise SystemExit(f"{run}: node-phase models are not supported here (see mechanism_mf)")
     model = RhizomeOperator2d(**best["model_config"]).eval()
     model.load_state_dict(best["model"])
     model = model.to(device)
