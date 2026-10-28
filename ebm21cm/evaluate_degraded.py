@@ -152,6 +152,8 @@ def main(argv=None):
         print(f"[{k + 1}/{len(test_cones)}] cone {int(cid)}: {len(mine)} slices", flush=True)
 
     summary = {"run": str(args.run.resolve()), "n_cones": len(test_cones),
+               "tb_note": "T_b is not like-for-like: the cache truth includes dv/dr, the adapter uses V=1. "
+                          "Use x_HI for the resolution control.",
                "stages": {name: {k: a.metrics() for k, a in v.items()} for name, v in accum.items()}}
     (args.out / "degraded.json").write_text(json.dumps({"summary": summary, "cones": per_cone}, indent=1))
     lines = [f"# 21cmFAST degraded to LoReLi resolution: {args.run.name}", "",

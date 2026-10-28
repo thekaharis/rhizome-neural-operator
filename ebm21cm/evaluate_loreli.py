@@ -212,6 +212,9 @@ def main(argv=None):
     ap.add_argument("--z-range", type=float, nargs=2, default=(5.0, 15.0), help="debug/synthetic: LOS redshift range")
     ap.add_argument("--z-window", type=float, nargs=2, default=None,
                     help="evaluate only this redshift window (e.g. 8.5 8.7 for a quick real-data check)")
+    ap.add_argument("--los-margin", type=int, default=0,
+                    help="exclude this many native slices at each valid end from the metrics (their LOS bands "
+                         "are edge-replicated); predictions are still written")
     args = ap.parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
     stats = training_stats(args.cache)
@@ -228,7 +231,8 @@ def main(argv=None):
         files = files[:args.limit]
     if not files:
         raise SystemExit("no cones selected")
-    print(f"{len(files)} cones, {len(stats['bands'])} bands, checkpoint step {best.get('step')}", flush=True)
+    print(f"{len(files)} cones, {len(stats['bands'])} bands, checkpoint step {best.get('step')}; "
+          f"scalars = oracle histories + training-mean parameters; los margin {args.los_margin}", flush=True)
 
     totals = {name: Accumulator() for name, _, _ in lm.STAGES}
     per_cone = []
@@ -255,7 +259,11 @@ def main(argv=None):
         cell = cone.l_perp / cone.n_native
         stages = {name: Accumulator() for name, _, _ in lm.STAGES}
         active = {name: [] for name in stages}
-        for i in np.flatnonzero(cone.valid):
+        valid = np.flatnonzero(cone.valid)
+        edge = set(valid[:args.los_margin]) | set(valid[-args.los_margin:]) if args.los_margin else set()
+        for i in valid:
+            if i in edge:
+                continue
             true = truth_x[crop, crop, i]
             stage = lm.stage_of(float(true.mean()))
             if stage is None:
@@ -280,7 +288,10 @@ def main(argv=None):
                     threshold = np.quantile(es, 1 - fraction)
                     stages[name].add_baseline("excursion", np.where(es >= threshold, 0.0, 1.0), true)
         record = {"sim": sim, "path": str(path), "l_perp": args.l_perp, "density_mean": args.density_mean,
-                  "velocity": args.velocity, "border": args.border, "n_valid": int(cone.n_slices),
+                  "velocity": args.velocity, "border": args.border, "los_margin": args.los_margin,
+                  "n_valid": int(cone.n_slices), "n_edge_excluded": len(edge),
+                  "scalars": {"histories": "oracle (cone's own x_HI/T_b band means)",
+                              "parameters": "training mean (normalized zero)"},
                   "n_active": {name: len(idx) for name, idx in active.items()},
                   "stages": {name: stages[name].metrics() for name in stages},
                   "seconds": round(time.time() - started, 1)}
@@ -303,7 +314,10 @@ def main(argv=None):
 
     summary = {"run": str(args.run.resolve()), "data": str(args.data.resolve()), "cache": str(args.cache.resolve()),
                "checkpoint_step": best.get("step"), "l_perp": args.l_perp, "density_mean": args.density_mean,
-               "velocity": args.velocity, "border": args.border, "n_cones": len(per_cone),
+               "velocity": args.velocity, "border": args.border, "los_margin": args.los_margin,
+               "n_cones": len(per_cone),
+               "scalars": {"histories": "oracle (cone's own x_HI/T_b band means)",
+                           "parameters": "training mean (normalized zero)"},
                "stages": {name: totals[name].metrics() for name in totals}}
     (args.out / "summary.json").write_text(json.dumps({"summary": summary, "cones": per_cone}, indent=1))
     write_markdown(args.out / "summary.md", summary)
@@ -313,7 +327,12 @@ def main(argv=None):
 def write_markdown(path, summary):
     lines = [f"# LoReLi zero-shot: {Path(summary['run']).name}", "",
              f"{summary['n_cones']} cones, L_perp = {summary['l_perp']:.0f} Mpc, "
-             f"density mean = {summary['density_mean']}, velocity = {summary['velocity']}, border = {summary['border']}",
+             f"density mean = {summary['density_mean']}, velocity = {summary['velocity']}, border = {summary['border']}, "
+             f"LOS margin = {summary['los_margin']}",
+             "",
+             "Scalars are the cone's own (oracle) histories and the training-mean parameters; the numbers are therefore "
+             "a history-conditioned upper bound, not a parameter-marginalized score. The first/last `--los-margin` "
+             "slices use edge-replicated LOS bands.",
              "", "| stage | n | x_HI RMSE | 2.3 Mpc | 4.7 Mpc | IoU | T_b RMSE [mK] | T_b PDF W1 | bubble W1 (0.5) | front width pred/truth [Mpc] |",
              "|---|---|---|---|---|---|---|---|---|---|"]
     for name, _, _ in lm.STAGES:
@@ -323,6 +342,15 @@ def write_markdown(path, summary):
                      f"{m['tb_pdf_w1']:.3f} | {m['bubble_w1_0.5']:.3f} | "
                      f"{m.get('front_width_pred_mpc', float('nan')):.2f} / "
                      f"{m.get('front_width_true_mpc', float('nan')):.2f} |")
+    lines += ["", "| stage | density IoU | density RMSE | excursion-set IoU | excursion-set RMSE |",
+              "|---|---|---|---|---|"]
+    for name, _, _ in lm.STAGES:
+        b = summary["stages"][name]
+        d, e = b["baseline_density"], b["baseline_excursion"]
+        lines.append(f"| {name} | {d['iou_matched']:.3f} | {d['xhi_rmse']:.3f} | "
+                     f"{e['iou_matched']:.3f} | {e['xhi_rmse']:.3f} |")
+    lines += ["", "At late stages the model IoU is close to the density baseline; use the 4.7 Mpc RMSE and the "
+                  "cross-correlation there, not IoU, for morphology."]
     path.write_text("\n".join(lines) + "\n")
 
 
