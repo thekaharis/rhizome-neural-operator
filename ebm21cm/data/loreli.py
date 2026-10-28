@@ -71,8 +71,9 @@ def _mirror_index(n, pad):
     """Length-2*pad+n axis indices, mirror-extended without repeating the edge."""
     if n == 1:
         return np.zeros(2 * pad + 1, dtype=np.int64)
-    i = np.abs(np.arange(-pad, n + pad)) % (2 * n)
-    return np.where(i >= n, 2 * n - 1 - i, i)
+    period = 2 * n - 2
+    i = np.abs(np.arange(-pad, n + pad)) % period
+    return np.where(i >= n, period - i, i)
 
 
 def mirror_pad(values, pad, axis=-1):
@@ -111,8 +112,8 @@ def resample_transverse(plane, n_out):
 def resample_los(cube, distance, target_distance):
     """(ny, nx, n) -> (ny, nx, len(target)) linear in comoving distance, edge-clamped."""
     position = np.interp(target_distance, distance, np.arange(len(distance)))
-    i0 = np.floor(position).astype(np.int64).clip(0, len(distance) - 1)
-    i1 = (i0 + 1).clip(0, len(distance) - 1)
+    i0 = np.floor(position).astype(np.int64).clip(0, min(len(distance), cube.shape[-1]) - 1)
+    i1 = np.minimum(i0 + 1, cube.shape[-1] - 1)
     t = (position - i0).astype(np.float32)
     return cube[..., i0] * (1 - t) + cube[..., i1] * t
 
@@ -162,7 +163,7 @@ def velocity_shape(delta, cell=TRAINING_CELL_MPC, cell_los=None):
     k2[0, 0, 0] = 1.0
     spectrum = np.fft.rfftn(np.asarray(delta, np.float32))
     return np.fft.irfftn((1j * kz[None, None, :] * spectrum / k2).astype(np.complex64),
-                         s=(ny, nx, nz)).astype(np.float32)
+                         s=(ny, nx, nz), axes=(0, 1, 2)).astype(np.float32)
 
 
 def linear_velocity(delta, z, cell=TRAINING_CELL_MPC, cell_los=None, omega_m=LORELI_OMEGA_M, h=LORELI_H):
@@ -206,13 +207,14 @@ class LoreliCone:
 
     def _validity(self):
         """Nonempty slices of the one contiguous run that holds the cone, with edge artefacts removed."""
-        dens = np.asarray(self.data[..., FIELDS.index("dens")], dtype=np.float32)
+        dens = np.array(self.data[..., FIELDS.index("dens")], dtype=np.float32)
         mean = dens.mean((0, 1))
-        valid = np.isfinite(self.data[..., FIELDS.index("dtb")]).all((0, 1)) & (mean > 0)
+        valid = np.isfinite(np.array(self.data[..., FIELDS.index("dtb")], np.float32)).all((0, 1)) & (mean > 0)
         if valid.any():
             # The first/last slice of a particle lightcone can hold a partly filled plane (18% low in density);
-            # interior slice means are constant to 0.2%, so a 5% cut removes the artefact rather than signal.
-            valid &= np.abs(mean / np.median(mean[valid]) - 1) <= 0.05
+            # interior slice means fluctuate by a few percent (large-scale modes), so a 10% cut removes the
+            # artefact rather than signal.
+            valid &= np.abs(mean / np.median(mean[valid]) - 1) <= 0.10
         idx = np.flatnonzero(valid)
         runs = np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1)
         keep = np.zeros(len(mean), bool)
@@ -222,7 +224,7 @@ class LoreliCone:
 
     def mean_density(self):
         if self._mean is None:
-            dens = np.asarray(self.data[..., FIELDS.index("dens")], np.float32)
+            dens = np.array(self.data[..., FIELDS.index("dens")], np.float32)
             good = dens > 0
             self._mean = float(dens[good].mean())
         return self._mean
@@ -230,8 +232,8 @@ class LoreliCone:
     def history(self):
         """(x_HI, T_b [mK]) means over all cells per native slice."""
         if self._history is None:
-            xhi = 1.0 - np.asarray(self.data[..., FIELDS.index("xion")], np.float32)
-            tb = np.asarray(self.data[..., FIELDS.index("dtb")], np.float32)
+            xhi = 1.0 - np.array(self.data[..., FIELDS.index("xion")], np.float32)
+            tb = np.array(self.data[..., FIELDS.index("dtb")], np.float32)
             self._history = (xhi.mean((0, 1)), np.nanmean(tb, axis=(0, 1)))
         return self._history
 
@@ -242,7 +244,7 @@ class LoreliCone:
             if name == "los_velocity":
                 out[name] = None
             elif name in FIELDS:
-                out[name] = np.asarray(self.data[:, :, start:stop, FIELDS.index(name)], np.float32)
+                out[name] = np.array(self.data[:, :, start:stop, FIELDS.index(name)], np.float32)
             else:
                 raise KeyError(name)
         return out
@@ -255,7 +257,22 @@ class LoreliCone:
         else:
             rho = np.where(good, dens, 0).sum((0, 1), keepdims=True) / np.maximum(
                 good.sum((0, 1), keepdims=True), 1)
-        return np.where(good, dens / rho - 1.0, 0.0).astype(np.float32)
+        ratio = np.divide(dens, rho, out=np.zeros_like(dens), where=np.asarray(rho) > 0)
+        return np.where(good, ratio - 1.0, 0.0).astype(np.float32)
+
+
+def area_matrix(n_native, n_out):
+    """(n_native, n_out) overlap weights: native cell averages of a finer periodic plane."""
+    edges_in = np.linspace(0.0, 1.0, n_native + 1)
+    edges_out = np.linspace(0.0, 1.0, n_out + 1)
+    weights = np.zeros((n_native, n_out), np.float32)
+    for i in range(n_native):
+        j0, j1 = np.searchsorted(edges_out, edges_in[i], "right") - 1, np.searchsorted(edges_out, edges_in[i + 1], "left")
+        for j in range(max(0, j0), min(n_out, j1 + 1)):
+            overlap = min(edges_in[i + 1], edges_out[j + 1]) - max(edges_in[i], edges_out[j])
+            if overlap > 0:
+                weights[i, j] = overlap / (edges_in[i + 1] - edges_in[i])
+    return weights
 
 
 def training_stats(cache):
@@ -303,11 +320,11 @@ class LoreliAdapter:
         resampling, so the amplitude follows the lightcone without chunk seams.
         """
         first, last = np.flatnonzero(self.cone.valid)[[0, -1]]
-        dense = self.cone.delta(self.cone.read(first, last + 1, fields=("dens",))["dens"])
-        padded = mirror_pad(dense, self.halo, -1)
-        shape = velocity_shape(padded, cell=self.l_perp / self.cone.n_native,
+        lo, hi = max(0, first - self.halo), min(self.cone.n_los, last + self.halo + 1)
+        dense = self.cone.delta(self.cone.read(lo, hi, fields=("dens",))["dens"])
+        shape = velocity_shape(dense, cell=self.l_perp / self.cone.n_native,
                                cell_los=float(np.median(np.diff(self.cone.distances))))
-        return shape[..., self.halo:self.halo + dense.shape[-1]], first
+        return shape, lo
 
     def _native(self, start, stop):
         raw = self.cone.read(start, stop)
@@ -342,7 +359,7 @@ class LoreliAdapter:
 
     def inputs(self, a, b):
         """Inputs for target indices [a, b): cond (n,26,280,280), scalars (n,38), phys (n,1,280,280)."""
-        fields, lo, _ = self._target(a, b)
+        fields, lo, hi = self._target(a, b)
         n = b - a
         centers = np.arange(a, b) - lo + self.halo
         delta, vel = fields["delta"], fields["los_velocity"]
@@ -356,8 +373,10 @@ class LoreliAdapter:
         phys = pad_to(np.stack([amplitude(z) * (1.0 + delta[:, :, a - lo + i])
                                 for i, z in enumerate(self.z_target[a:b])], -1), self.domain)
         phys = phys.transpose(2, 0, 1)[:, None]
-        hist_x = band_profile(np.pad(self.history[0], (self.halo, self.halo), mode="edge"), centers, self.bands)
-        hist_t = band_profile(np.pad(self.history[1], (self.halo, self.halo), mode="edge"), centers, self.bands)
+        hist_x = band_profile(np.pad(self.history[0][lo:hi], (self.halo, self.halo), mode="edge"),
+                              centers, self.bands)
+        hist_t = band_profile(np.pad(self.history[1][lo:hi], (self.halo, self.halo), mode="edge"),
+                              centers, self.bands)
         scalars = np.concatenate([(1.0 / (1.0 + self.z_target[a:b]))[:, None],
                                   np.zeros((n, len(self.stats["param_names"])), np.float32),
                                   hist_x, hist_t], 1).astype(np.float32)

@@ -42,7 +42,6 @@ from .loreli_inference import load_model, map_to_native, predict_cone
 SIGMAS = (0.0, 2.3, 4.7)
 CURVE = (0.0, 0.5, 1.0, 1.5, 2.3, 3.0, 4.0, 4.7, 6.0, 8.0)
 BUBBLE_THRESHOLDS = (0.1, 0.5, 0.9)
-FRONT_EDGES = np.arange(-12.0, 12.01, 1.0)
 POWER_EDGES = lm.power_edges()
 
 
@@ -61,7 +60,7 @@ class Accumulator:
         self.p_aa = np.zeros_like(self.p_ab)
         self.p_bb = np.zeros_like(self.p_ab)
         self.power_n = 0
-        self.front_n = np.zeros(len(FRONT_EDGES) - 1)
+        self.front_n = np.zeros(len(lm.FRONT_EDGES) - 1)
         self.front_true = np.zeros_like(self.front_n)
         self.front_pred = np.zeros_like(self.front_n)
         self.bubble = {t: [] for t in BUBBLE_THRESHOLDS}
@@ -93,7 +92,7 @@ class Accumulator:
         for threshold in BUBBLE_THRESHOLDS:
             self.bubble[threshold].append(
                 (lm.bubble_sizes(true, cell, threshold), lm.bubble_sizes(pred, cell, threshold)))
-        profile = lm.front_profile(pred, true, cell, FRONT_EDGES)
+        profile = lm.front_profile(pred, true, cell, lm.FRONT_EDGES)
         if profile is not None:
             counts, sum_true, sum_pred = profile
             self.front_n += counts
@@ -129,9 +128,10 @@ class Accumulator:
         for threshold in BUBBLE_THRESHOLDS:
             pairs = self.bubble[threshold]
             distances = [lm.metrics.size_distance(a, b) for a, b in pairs]
-            out[f"bubble_w1_{threshold}"] = float(np.nanmean(distances)) if distances else float("nan")
+            distances = [x for x in distances if np.isfinite(x)]
+            out[f"bubble_w1_{threshold}"] = float(np.mean(distances)) if distances else float("nan")
         if self.front_n.sum():
-            d = (FRONT_EDGES[:-1] + FRONT_EDGES[1:]) / 2
+            d = (lm.FRONT_EDGES[:-1] + lm.FRONT_EDGES[1:]) / 2
             mean_true = np.divide(self.front_true, self.front_n, out=np.full_like(self.front_true, np.nan),
                                   where=self.front_n > 0)
             mean_pred = np.divide(self.front_pred, self.front_n, out=np.full_like(self.front_pred, np.nan),
@@ -141,7 +141,7 @@ class Accumulator:
         for name, entry in self.base.items():
             out[f"baseline_{name}"] = {
                 "iou_matched": float(entry["iou"] / entry["n"]) if entry["n"] else float("nan"),
-                "xhi_rmse": float(np.sqrt(entry["se"] / max(entry["cells"], 1)))}
+                "xhi_rmse": float(np.sqrt(entry["se"] / entry["cells"])) if entry["cells"] else float("nan")}
         return out
 
     def merge(self, other):
@@ -195,7 +195,6 @@ def main(argv=None):
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--ids", type=int, nargs="*", default=None, help="simulation numbers (default: all)")
     ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--skip-existing", action="store_true")
     ap.add_argument("--l-perp", type=float, default=294.0, choices=(294.0, 300.0))
     ap.add_argument("--density-mean", choices=("slice", "cone"), default="slice")
     ap.add_argument("--velocity", choices=("linear", "zero"), default="linear")
@@ -208,6 +207,11 @@ def main(argv=None):
                     help="slices per stage for the excursion-set baseline (0 = all shape slices)")
     ap.add_argument("--no-baselines", action="store_true")
     ap.add_argument("--save-cones", action="store_true", help="write x_HI/T_b predictions per cone as float16 h5")
+    ap.add_argument("--n-native", type=int, default=128, help="debug/synthetic: native transverse size")
+    ap.add_argument("--n-los", type=int, default=1536, help="debug/synthetic: native LOS length")
+    ap.add_argument("--z-range", type=float, nargs=2, default=(5.0, 15.0), help="debug/synthetic: LOS redshift range")
+    ap.add_argument("--z-window", type=float, nargs=2, default=None,
+                    help="evaluate only this redshift window (e.g. 8.5 8.7 for a quick real-data check)")
     args = ap.parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
     stats = training_stats(args.cache)
@@ -231,11 +235,14 @@ def main(argv=None):
     for k, path in enumerate(files):
         sim = int(path.stem.split("simu")[-1])
         target = args.out / f"cone_{sim}.json"
-        if args.skip_existing and target.exists():
-            per_cone.append(json.loads(target.read_text()))
-            continue
         started = time.time()
-        cone = LoreliCone(path, l_perp=args.l_perp, density_mean=args.density_mean)
+        cone = LoreliCone(path, l_perp=args.l_perp, density_mean=args.density_mean,
+                          n_native=args.n_native, n_los=args.n_los, z_range=tuple(args.z_range))
+        if args.z_window is not None:
+            cone.valid &= (cone.z >= args.z_window[0]) & (cone.z <= args.z_window[1])
+            cone.n_slices = int(cone.valid.sum())
+            if not cone.n_slices:
+                raise SystemExit(f"{path}: no valid slices in z window {args.z_window}")
         adapter = LoreliAdapter(cone, stats, velocity=args.velocity)
         xhi, tb = predict_cone(adapter, model, best, device, args.batch_size)
         pred_x, pred_tb, keep = map_to_native(xhi, tb, adapter, cone, args.border)

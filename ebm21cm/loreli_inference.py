@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .data.loreli import area_matrix
 from .model.remap import remapped_model
 from .model.rhizome import build_model
 from .train_rhizome_mf2d import tb_normalized
@@ -61,7 +62,7 @@ def predict(model, inputs, best, device):
 def predict_cone(adapter, model, best, device="cuda", batch=16, progress=None):
     """Predict every target slice of one cone; (x_HI, T_b) as (n_target, n_out, n_out)."""
     n = len(adapter.target_distance)
-    xhi = np.empty((n, adapter.n_out, adapter.n_out), np.float32)
+    xhi = np.empty((n, adapter.domain, adapter.domain), np.float32)
     tb = np.empty_like(xhi)
     for a in range(0, n, batch):
         b = min(n, a + batch)
@@ -72,18 +73,12 @@ def predict_cone(adapter, model, best, device="cuda", batch=16, progress=None):
     return xhi, tb
 
 
-def area_matrix(n_native, n_out):
-    """(n_native, n_out) overlap weights: native cell averages of a finer periodic plane."""
-    edges_in = np.linspace(0.0, 1.0, n_native + 1)
-    edges_out = np.linspace(0.0, 1.0, n_out + 1)
-    weights = np.zeros((n_native, n_out), np.float32)
-    for i in range(n_native):
-        j0, j1 = np.searchsorted(edges_out, edges_in[i], "right") - 1, np.searchsorted(edges_out, edges_in[i + 1], "left")
-        for j in range(max(0, j0), min(n_out, j1 + 1)):
-            overlap = min(edges_in[i + 1], edges_out[j + 1]) - max(edges_in[i], edges_out[j])
-            if overlap > 0:
-                weights[i, j] = overlap / (edges_in[i + 1] - edges_in[i])
-    return weights
+def downsample_transverse(planes, adapter, cone):
+    """Crop the 280-cell domain to the valid n_out plane and area-average to the native grid."""
+    start = (adapter.domain - adapter.n_out) // 2
+    planes = planes[..., start:start + adapter.n_out, start:start + adapter.n_out]
+    weights = area_matrix(cone.n_native, adapter.n_out)
+    return np.einsum("ij,...jk,lk->...il", weights, planes, weights, optimize=True).astype(np.float32)
 
 
 def map_to_native(xhi, tb, adapter, cone, border=0):
@@ -93,12 +88,8 @@ def map_to_native(xhi, tb, adapter, cone, border=0):
     physical distance of the plane edge are marked False in the returned mask.
     Returns (x_HI, T_b) as (n_native, 128, 128), NaN outside the valid run.
     """
-    start = (adapter.domain - adapter.n_out) // 2
-    xhi = xhi[:, start:start + adapter.n_out, start:start + adapter.n_out]
-    tb = tb[:, start:start + adapter.n_out, start:start + adapter.n_out]
-    weights = area_matrix(cone.n_native, xhi.shape[-1])
-    xhi = np.tensordot(np.tensordot(xhi, weights.T, axes=([2], [0])), weights.T, axes=([1], [0]))
-    tb = np.tensordot(np.tensordot(tb, weights.T, axes=([2], [0])), weights.T, axes=([1], [0]))
+    xhi = downsample_transverse(xhi, adapter, cone)
+    tb = downsample_transverse(tb, adapter, cone)
     valid = np.flatnonzero(cone.valid)
     position = np.interp(cone.distances[valid], adapter.target_distance, np.arange(len(adapter.target_distance)))
     i0 = np.floor(position).astype(np.int64).clip(0, len(adapter.target_distance) - 1)
