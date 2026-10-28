@@ -35,7 +35,7 @@ import torch
 
 from .data.mf_slices import MFMemorySplit
 from .model.rhizome import RhizomeOperator2d, RhizomeUNet2d, build_model, periodic_upsample
-from .train_rhizome_mf2d import tb_normalized
+from .train_rhizome_mf2d import node_output, node_scalars, tb_normalized
 
 
 class Tracker:
@@ -80,13 +80,17 @@ def rollout(run, max_steps, split, device, batch_size, max_slices=0, seed=0):
     two_level = isinstance(model, RhizomeUNet2d)
     if not two_level and (not isinstance(model, RhizomeOperator2d) or model.untied):
         raise SystemExit(f"{run}: only tied rhizome models can be rolled out further")
-    data = MFMemorySplit(meta["cache"], split, "cpu", device)
+    node = best.get("node_phase")
+    data = MFMemorySplit(meta["cache"], split, "cpu", device, w_mode=node and node["w_mode"])
     keep = best.get("scalar_keep")
     if keep is not None:
         data.scalars = data.scalars[:, keep]
     off, scale = best["tb_norm"]
     head = best["head"]
     sweeps = {"fine": Tracker(max_steps), "coarse": Tracker(max_steps)} if two_level else {"": Tracker(max_steps)}
+
+    def decode(state, batch):
+        return node_output(model.decode(state), batch.get("w"), node)
 
     def iterate(tracker, state, forcing, cell, batch, n):
         """n updates of ``cell``; with a tracker, record state changes and decoded errors after each."""
@@ -95,7 +99,7 @@ def rollout(run, max_steps, split, device, batch_size, max_slices=0, seed=0):
             new = cell(state, forcing)
             if tracker is not None:
                 tracker.states(t, prev2, state, new)
-                tracker.errors(t, model.decode(new), batch, head, off, scale)
+                tracker.errors(t, decode(new, batch), batch, head, off, scale)
             prev2, state = state, new
         return state
 
@@ -104,7 +108,7 @@ def rollout(run, max_steps, split, device, batch_size, max_slices=0, seed=0):
         if max_slices and max_slices < len(data):
             positions = np.sort(np.random.default_rng(seed).choice(len(data), max_slices, replace=False))
         for batch in data.loader(batch_size, positions):
-            cond, scal = batch["cond"], batch["scalars"]
+            cond, scal = batch["cond"], node_scalars(batch["scalars"], batch.get("w"), node)
             if not two_level:
                 forcing = model.lift(cond) + model.scalar_embed(scal)[:, :, None, None]
                 iterate(sweeps[""], forcing.tanh(), forcing, model.cells[0], batch, max_steps)
@@ -124,7 +128,7 @@ def rollout(run, max_steps, split, device, batch_size, max_slices=0, seed=0):
                     sweeps["coarse"].states(t, prev2, coarse, new)
                     ff = fine_forcing(new)
                     state = iterate(None, ff.tanh(), ff, model.fine, batch, model.n_steps)
-                    sweeps["coarse"].errors(t, model.decode(state), batch, head, off, scale)
+                    sweeps["coarse"].errors(t, decode(state, batch), batch, head, off, scale)
                     prev2, coarse = coarse, new
                     if t + 1 == model.coarse_steps:
                         trained_coarse = coarse

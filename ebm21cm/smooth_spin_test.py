@@ -25,10 +25,11 @@ import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter1d
 
+from .data.lightcone import node_weight
 from .data.mf_slices import FNO_ROOT, PREPARATION, fno_dataset
 from .export_slicewise_mf import slice_inputs
 from .model.rhizome import RhizomeOperator2d
-from .train_rhizome_mf2d import U_MAX
+from .train_rhizome_mf2d import U_MAX, node_output, node_scalars
 
 
 def main(argv=None):
@@ -57,6 +58,7 @@ def main(argv=None):
     model = RhizomeOperator2d(**best["model_config"]).to(device).eval()
     model.load_state_dict(best["model"])
     tb_off, tb_scale = best["tb_norm"]
+    node = best.get("node_phase")
     row_of = {int(re.findall(r"\d+", Path(dataset.file_paths[r]).stem)[-1]): int(r) for r in rows["test"]}
 
     ref = json.loads(args.reference.read_text())
@@ -74,14 +76,18 @@ def main(argv=None):
             ref_d = {key: d[key] for key in ("truth", "tb_truth", "density", "z_native")}
         z = np.asarray(dataset.redshifts[row])
         pick = np.abs(z[None, :] - ref_d["z_native"][:, None]).argmin(axis=1)
-        inp = slice_inputs(dataset, row, np.arange(len(z)), head, LOSWindowConfig, bands, ip, wide=wide)
+        w = None if node is None else node_weight(z, float(dataset.params[row][param_names.index("OMm")]),
+                                                   node["w_mode"])
+        inp = slice_inputs(dataset, row, np.arange(len(z)), head, LOSWindowConfig, bands, ip, wide=wide, w=w)
         n = len(z)
         x = np.empty((n, *inp["cond"].shape[-2:]), np.float32)
         u = np.empty_like(x)
         with torch.no_grad():
             for a in range(0, n, args.batch_size):
                 b = slice(a, a + args.batch_size)
-                out = model(torch.from_numpy(inp["cond"][b]).to(device), torch.from_numpy(inp["scalars"][b]).to(device))
+                wb = None if node is None else torch.from_numpy(inp["w"][b]).to(device)
+                out = node_output(model(torch.from_numpy(inp["cond"][b]).to(device),
+                                        node_scalars(torch.from_numpy(inp["scalars"][b]).to(device), wb, node)), wb, node)
                 x[b] = out[:, 0].sigmoid().float().cpu().numpy()
                 u[b] = out[:, 1].float().cpu().numpy()
         x, u, phys = (np.moveaxis(v, 0, -1) for v in (x, u, inp["phys"].astype(np.float32)))

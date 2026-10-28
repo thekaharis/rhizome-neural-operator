@@ -26,18 +26,19 @@ import torch
 
 from .data.cache import band_extent
 from .data.mf_slices import FNO_ROOT, PREPARATION, band_means, fno_dataset
+from .data.lightcone import node_weight
 from .model.rhizome import build_model
-from .train_rhizome_mf2d import tb_normalized
+from .train_rhizome_mf2d import node_output, node_scalars, tb_normalized
 
 
-def slice_inputs(dataset, row, idx, head, LOSWindowConfig, bands, ip, chunk=512, wide=()):
+def slice_inputs(dataset, row, idx, head, LOSWindowConfig, bands, ip, chunk=512, wide=(), w=None):
     """cond, scalars, phys, x_HI, normalized T_b for sorted native indices ``idx``
-    (same arithmetic as ``mf_slices.build``)."""
+    (same arithmetic as ``mf_slices.build``), and the node phase w[idx] if ``w`` (one per native slice) is given."""
     wide = [tuple(b) for b in wide]
     below, above = band_extent(list(bands) + wide)
     halo = max(below, above + 1)
     config = LOSWindowConfig(mode="contiguous", size=chunk + 2 * halo, halo=halo, windows_per_cone=1)
-    parts = {k: [] for k in ("cond", "scalars", "phys", "xhi", "tb")}
+    parts = {k: [] for k in ("cond", "scalars", "phys", "xhi", "tb") + (("w",) if w is not None else ())}
     for start in range(0, len(dataset.redshifts[row]), chunk):
         sel = idx[(idx >= start) & (idx < start + chunk)]
         if sel.size == 0:
@@ -56,6 +57,8 @@ def slice_inputs(dataset, row, idx, head, LOSWindowConfig, bands, ip, chunk=512,
         parts["phys"].append(np.moveaxis(phys[..., j], -1, 0))
         parts["xhi"].append(np.moveaxis(y[0].numpy()[..., j], -1, 0))
         parts["tb"].append(np.moveaxis(y[1].numpy()[..., j], -1, 0))
+        if w is not None:
+            parts["w"].append(w[sel].astype(np.float32))
     return {k: np.concatenate(v) for k, v in parts.items()}
 
 
@@ -70,11 +73,12 @@ def _band_means_gpu(values, centers, bands):
 
 
 def iter_slice_inputs_gpu(dataset, row, idx, head, LOSWindowConfig, bands, ip, device, chunk=512, wide=(),
-                          targets=False, prefetch=True):
+                          targets=False, prefetch=True, w=None):
     """Per-chunk device inputs for sorted native indices ``idx`` (one chunk = one
     fno-21cm window of ``chunk`` cores). With ``prefetch`` a background thread reads
     the next window from disk while the current chunk is processed, so file I/O
-    overlaps the GPU work. Same arithmetic as the CPU path (band sums in float64)."""
+    overlaps the GPU work. Same arithmetic as the CPU path (band sums in float64).
+    ``w`` (one per native slice) adds the chunk's node phases."""
     from concurrent.futures import ThreadPoolExecutor
 
     wide = [tuple(b) for b in wide]
@@ -107,15 +111,17 @@ def iter_slice_inputs_gpu(dataset, row, idx, head, LOSWindowConfig, bands, ip, d
             if targets:
                 y = sample["y"].to(device, non_blocking=True)
                 out["xhi"], out["tb"] = y[0][..., j].movedim(-1, 0), y[1][..., j].movedim(-1, 0)
+            if w is not None:
+                out["w"] = torch.as_tensor(w[sel], dtype=torch.float32, device=device)
             yield out
 
 
 def slice_inputs_gpu(dataset, row, idx, head, LOSWindowConfig, bands, ip, device, chunk=512, wide=(),
-                     targets=False, prefetch=True):
+                     targets=False, prefetch=True, w=None):
     """All of ``iter_slice_inputs_gpu`` concatenated: device tensors cond (n, C, H, W),
-    scalars (n, S), phys (n, H, W) (and xhi / normalized tb with ``targets``)."""
+    scalars (n, S), phys (n, H, W) (and xhi / normalized tb with ``targets``, w with ``w``)."""
     parts = list(iter_slice_inputs_gpu(dataset, row, idx, head, LOSWindowConfig, bands, ip, device, chunk, wide,
-                                       targets, prefetch))
+                                       targets, prefetch, w))
     return {k: torch.cat([p[k] for p in parts]) for k in parts[0]}
 
 
@@ -153,6 +159,13 @@ def main(argv=None):
     tb_off, tb_scale = best["tb_norm"]
     keep = best.get("scalar_keep")  # history-ablation models see a subset of the scalars
     keep_t = None if keep is None else torch.as_tensor(keep, device=device)
+    node = best.get("node_phase")  # node-phase models also need each slice's w
+    omm = param_names.index("OMm")
+
+    def row_w(row):
+        if node is None:
+            return None
+        return node_weight(dataset.redshifts[row], float(dataset.params[row][omm]), node["w_mode"])
     # Sample ids come from the file names (mirror row != sample id after row 72), as in export_cubes3d.
     row_of = {int(re.findall(r"\d+", Path(dataset.file_paths[r]).stem)[-1]): int(r) for r in rows["test"]}
 
@@ -164,7 +177,9 @@ def main(argv=None):
             for a in range(0, n, args.batch_size):
                 b = slice(a, a + args.batch_size)
                 scal = inp["scalars"][b] if keep is None else inp["scalars"][b][:, keep]
-                out = model(torch.as_tensor(inp["cond"][b]).to(device), torch.as_tensor(scal).to(device))
+                w = None if node is None else torch.as_tensor(inp["w"][b]).to(device)
+                out = node_output(model(torch.as_tensor(inp["cond"][b]).to(device),
+                                        node_scalars(torch.as_tensor(scal).to(device), w, node)), w, node)
                 t = tb_normalized(out, torch.as_tensor(inp["phys"][b][:, None]).to(device), best["head"], tb_off, tb_scale)
                 xhi[b] = out[:, 0].sigmoid().float().cpu().numpy()
                 tb[b] = (t[:, 0] * tb_scale + tb_off).float().cpu().numpy()
@@ -176,15 +191,17 @@ def main(argv=None):
         Default: inputs built on the GPU chunk by chunk, each chunk predicted as soon as it is
         built while the next window is read from disk. ``--cpu-inputs``: the reference CPU path."""
         if args.cpu_inputs:
-            inp = slice_inputs(dataset, row, idx, head, LOSWindowConfig, bands, ip, wide=wide)
+            inp = slice_inputs(dataset, row, idx, head, LOSWindowConfig, bands, ip, wide=wide, w=row_w(row))
             return (*predict(inp), inp["xhi"], inp["tb"])
         xs, ts, tx, tt = [], [], [], []
         with torch.no_grad():
             for g in iter_slice_inputs_gpu(dataset, row, idx, head, LOSWindowConfig, bands, ip, device, wide=wide,
-                                           targets=True):
+                                           targets=True, w=row_w(row)):
                 for a in range(0, len(g["cond"]), args.batch_size):
                     b = slice(a, a + args.batch_size)
-                    o = model(g["cond"][b], g["scalars"][b] if keep_t is None else g["scalars"][b][:, keep_t])
+                    w = None if node is None else g["w"][b]
+                    scal = g["scalars"][b] if keep_t is None else g["scalars"][b][:, keep_t]
+                    o = node_output(model(g["cond"][b], node_scalars(scal, w, node)), w, node)
                     t = tb_normalized(o, g["phys"][b][:, None], best["head"], tb_off, tb_scale)
                     xs.append(o[:, 0].sigmoid().float())
                     ts.append((t[:, 0] * tb_scale + tb_off).float())

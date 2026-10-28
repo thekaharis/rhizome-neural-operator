@@ -14,6 +14,14 @@ Output channel 0 is the x_HI logit. ``--head structured`` reads channel 1 as the
 spin variable u of T_b = x_HI * phys * (1 - exp(u)), ``phys`` = A(z)(1+delta)V
 from the cache (the 3-D ``StructuredBrightness3d`` physics on one slice);
 ``--head plain`` reads it as normalized T_b. Loss: BCE(x_HI) + tb_weight * MSE(T_b).
+
+Node phase (default off): w is the slice's 21cmFAST interpolation weight between its
+two coeval node boxes, x = (1 - w) X_a + w X_b (``data.lightcone.node_weight``,
+``--w-mode chi|z``). ``--node-phase-input`` appends w to the scalars.
+``--two-node-head`` adds output channel 2, d: the decoder's logits l_a (channel 0)
+and l_b = l_a - softplus(d) (``--no-node-monotone``: l_b = d) give
+x = (1 - w) sigmoid(l_a) + w sigmoid(l_b), collapsed in log space to the x_HI logit
+log x - log(1 - x) that every consumer of channel 0 reads (``two_node_output``).
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .data.lightcone import W_MODES
 from .data.memory import MemoryStream
 from .data.mf_slices import MFMemorySplit
 from .model.rhizome import build_model
@@ -80,6 +89,11 @@ class MFConfig(LongRunConfig):
     disc_radius: float = 0.0
     disc_pathways: int = 0
     disc_norm: str = ""  # "l1": disc weights g * v / sum|v| per channel, total weight independent of the disc area
+    # Node phase w of each slice (see the module docstring): as a scalar input and/or through the two-node x_HI head.
+    node_phase_input: bool = False
+    two_node_head: bool = False
+    node_monotone: bool = True  # two-node head: l_b = l_a - softplus(d), a cell does not recombine between nodes
+    w_mode: str = "chi"         # "chi": w linear in comoving distance; "z": linear in redshift
 
 
 class PowerLoss(torch.nn.Module):
@@ -124,6 +138,42 @@ def scalar_keep(names, drop):
     return keep
 
 
+def node_phase(config):
+    """The checkpoint's node-phase settings, or None when neither node-phase option is on (the default)."""
+    if not (config.node_phase_input or config.two_node_head):
+        return None
+    if config.w_mode not in W_MODES:
+        raise ValueError(f"w_mode must be one of {W_MODES}")
+    return {"w_mode": config.w_mode, "input": config.node_phase_input, "two_node": config.two_node_head,
+            "monotone": config.node_monotone}
+
+
+def node_scalars(scalars, w, node):
+    """``scalars`` with the node phase w (B,) appended as the last column if the model takes it as input."""
+    return torch.cat([scalars, w[:, None].to(scalars.dtype)], 1) if node and node["input"] else scalars
+
+
+def two_node_output(out, w, monotone=True):
+    """(B, 3, H, W) two-node output -> (B, 2, H, W) with channel 0 the x_HI logit log x - log(1 - x) of
+
+        x = (1 - w) sigmoid(l_a) + w sigmoid(l_b),   l_a = out[:, 0],  l_b = l_a - softplus(out[:, 2]) or out[:, 2].
+
+    log x and log(1 - x) are log-sum-exps of log-sigmoids, so the logit is finite for finite logits and any w in
+    [0, 1] (no clamping needed), its sigmoid is x, and BCE-with-logits on it is the log-space BCE of x."""
+    w = w.to(out.dtype).view(-1, 1, 1, 1)
+    l_a = out[:, :1]
+    l_b = l_a - F.softplus(out[:, 2:3]) if monotone else out[:, 2:3]
+    log_a, log_b = torch.log1p(-w), torch.log(w)
+    log_x = torch.logaddexp(log_a + F.logsigmoid(l_a), log_b + F.logsigmoid(l_b))
+    log_1mx = torch.logaddexp(log_a + F.logsigmoid(-l_a), log_b + F.logsigmoid(-l_b))
+    return torch.cat([log_x - log_1mx, out[:, 1:2]], 1)
+
+
+def node_output(out, w, node):
+    """The network output with channel 0 the x_HI logit, for every head."""
+    return two_node_output(out, w, node["monotone"]) if node and node["two_node"] else out
+
+
 def tb_normalized(out, phys, head, tb_offset, tb_scale):
     """Normalized T_b from the network output (B, 2, H, W)."""
     if head == "plain":
@@ -133,12 +183,13 @@ def tb_normalized(out, phys, head, tb_offset, tb_scale):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, head, tb_norm, collect=False, power=None):
+def evaluate(model, loader, device, head, tb_norm, collect=False, power=None, node=None):
     model.eval()
     sums = {"bce": 0.0, "x_se": 0.0, "t_se": 0.0, "n": 0, "p_sum": 0.0, "p_n": 0, "px_sum": 0.0}
     kept = {"x_pred": [], "x_true": [], "t_pred": [], "t_true": [], "z": [], "cone_id": []}
     for batch in loader:
-        out = model(batch["cond"], batch["scalars"])
+        w = batch.get("w")
+        out = node_output(model(batch["cond"], node_scalars(batch["scalars"], w, node)), w, node)
         t = tb_normalized(out, batch["phys"], head, *tb_norm)
         x, y = out[:, :1].sigmoid(), batch["target"]
         sums["bce"] += float(F.binary_cross_entropy_with_logits(out[:, :1], y[:, :1], reduction="sum"))
@@ -175,9 +226,11 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
     if not resume and run_dir.exists() and any(run_dir.iterdir()):
         raise ValueError("run directory is not empty; use --resume or a new directory")
     storage = device if config.storage == "device" else torch.device("cpu")
+    node = node_phase(config)
+    w_mode = node and node["w_mode"]
     t0 = time.perf_counter()
-    train = MFMemorySplit(cache_path, "train", storage, device)
-    val = MFMemorySplit(cache_path, "val", storage, device)
+    train = MFMemorySplit(cache_path, "train", storage, device, w_mode=w_mode)
+    val = MFMemorySplit(cache_path, "val", storage, device, w_mode=w_mode)
     print(f"Loaded train/val: {(train.nbytes + val.nbytes) / 2**30:.1f} GiB, {len(train)}/{len(val)} rows, "
           f"{time.perf_counter() - t0:.0f} s", flush=True)
     norm = json.loads(train.attrs["normalization"])["brightness_temp"]
@@ -191,7 +244,8 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
     eval_batch = config.eval_batch_size or config.batch_size
     stream = MemoryStream(train, config.batch_size, config.seed)
     val_loader = val.loader(eval_batch)
-    model_config = {"in_channels": train.cond.shape[1], "out_channels": 2, "scalar_dim": train.scalars.shape[1],
+    model_config = {"in_channels": train.cond.shape[1], "out_channels": 3 if node and node["two_node"] else 2,
+                    "scalar_dim": train.scalars.shape[1] + bool(node and node["input"]),
                     "width": config.width, "modes": config.modes, "n_steps": config.updates,
                     "step_size": config.step_size}
     if config.radius:
@@ -255,7 +309,7 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
         plateau, best_model, history, stopped = PlateauState(**ck["plateau"]), ck["best_model"], ck["history"], ck["stopped"]
         print(f"Resumed step {step}; best validation score {plateau.best:.6f}", flush=True)
     else:
-        scores = evaluate(model, val_loader, device, config.head, tb_norm, power=power)
+        scores = evaluate(model, val_loader, device, config.head, tb_norm, power=power, node=node)
         plateau, best_model = PlateauState(scores["score"], scores["score"]), _cpu_state(model)
         history.append({"step": 0, **{f"val_{k}": v for k, v in scores.items()}, "lr": config.lr})
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -265,7 +319,7 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
             "tb_normalization": tb_norm, "git_commit": git_commit(root), "scalar_keep": keep,
             "rows": {"train": len(train), "val": len(val)},
             "objective": "BCE(x_HI) + tb_weight * MSE(normalized T_b); selection: mean normalized MSE",
-            "initial_max_steps": config.max_steps}, indent=2))
+            "initial_max_steps": config.max_steps, **({"node_phase": node} if node else {})}, indent=2))
     start = time.perf_counter()
 
     def save():
@@ -276,7 +330,8 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
                       "best_model": best_model, "history": history, "stopped": stopped}, run_dir / "last.pt")
         _atomic_save({"model": best_model, "model_config": model_config, "head": config.head, "tb_norm": tb_norm,
                       "step": plateau.best_step, "validation_score": plateau.best,
-                      **({"scalar_keep": keep} if config.drop_history else {})}, run_dir / "best.pt")
+                      **({"scalar_keep": keep} if config.drop_history else {}),
+                      **({"node_phase": node} if node else {})}, run_dir / "best.pt")
         (run_dir / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in history))
         return saved
 
@@ -292,7 +347,8 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
             steps["n_steps"] = int(rng.integers(t_range[0], t_range[1] + 1))
         if tc_range:
             steps["coarse_steps"] = int(rng.integers(tc_range[0], tc_range[1] + 1))
-        out = model(batch["cond"], batch["scalars"], **steps)
+        w = batch.get("w")
+        out = node_output(model(batch["cond"], node_scalars(batch["scalars"], w, node), **steps), w, node)
         t = tb_normalized(out, batch["phys"], config.head, *tb_norm)
         loss = F.binary_cross_entropy_with_logits(out[:, :1], y[:, :1]) + config.tb_weight * F.mse_loss(t, y[:, 1:])
         if config.power_weight:
@@ -309,7 +365,7 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
         window_loss += float(loss.detach())
         window_n += 1
         if step % config.val_every == 0:
-            scores = evaluate(model, val_loader, device, config.head, tb_norm, power=power)
+            scores = evaluate(model, val_loader, device, config.head, tb_norm, power=power, node=node)
             lr = optimizer.param_groups[0]["lr"]
             next_lr, stopped, improved = plateau.observe(scores["score"], step, lr, config)
             if improved:
@@ -334,9 +390,10 @@ def run(cache_path, run_dir, config, device="cuda", resume=False):
               "best_validation_score": plateau.best, "elapsed_training_seconds": seconds}
     if stopped:
         model.load_state_dict(best_model)
-        test = MFMemorySplit(cache_path, "test", storage, device)
+        test = MFMemorySplit(cache_path, "test", storage, device, w_mode=w_mode)
         test.scalars = test.scalars[:, keep]
-        scores, kept = evaluate(model, test.loader(eval_batch), device, config.head, tb_norm, collect=True, power=power)
+        scores, kept = evaluate(model, test.loader(eval_batch), device, config.head, tb_norm, collect=True, power=power,
+                                node=node)
         result["test"] = scores
         np.savez_compressed(run_dir / "test_predictions.npz", **kept)
     (run_dir / "results.json").write_text(json.dumps(result, indent=2))
@@ -353,7 +410,8 @@ def main(argv=None):
     for f in fields(MFConfig):
         if f.name in ("data", "channels", "train_cones"):
             continue
-        p.add_argument("--" + f.name.replace("_", "-"), type=type(f.default), default=f.default)
+        kind = {"action": argparse.BooleanOptionalAction} if isinstance(f.default, bool) else {"type": type(f.default)}
+        p.add_argument("--" + f.name.replace("_", "-"), default=f.default, **kind)
     a = p.parse_args(argv)
     config = MFConfig(**{f.name: getattr(a, f.name) for f in fields(MFConfig)
                          if f.name not in ("data", "channels", "train_cones")})

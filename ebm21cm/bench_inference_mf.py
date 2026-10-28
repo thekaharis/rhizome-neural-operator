@@ -66,6 +66,8 @@ def bench_2d(run, sid, device, batches, repeats):
     n = len(dataset.redshifts[row])
     ip = [list(dataset.channel_names).index(p) for p in param_names]
     best = torch.load(run / "best.pt", map_location="cpu", weights_only=False)
+    if best.get("node_phase"):
+        raise SystemExit(f"{run}: node-phase models are not supported by this benchmark")
     model = RhizomeOperator2d(**best["model_config"]).to(device).eval()
     model.load_state_dict(best["model"])
     tb_off, tb_scale = best["tb_norm"]

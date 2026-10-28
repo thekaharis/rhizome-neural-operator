@@ -45,7 +45,10 @@ import h5py
 import numpy as np
 import torch
 
+from .data.lightcone import node_weight
+from .data.mf_slices import cache_omega_m
 from .model.rhizome import MultiPathIntegral2d, RhizomeOperator2d
+from .train_rhizome_mf2d import node_output, node_scalars
 
 SPLIT_CODE = {"train": 0, "val": 1, "test": 2}
 
@@ -129,6 +132,7 @@ def main(argv=None):
     model.load_state_dict(best["model"])
     model = model.double()
     keep = best.get("scalar_keep")
+    node = best.get("node_phase")
     inter = model.cells[0].interaction
     width = model.width
     bands = [list(b) for b in json.loads(meta["cache_attrs"]["bands"])]
@@ -145,9 +149,15 @@ def main(argv=None):
         scal = torch.from_numpy(d["scalars"].astype(np.float64))[None]
         if keep is not None:
             scal = scal[:, keep]
+        w = None
+        if node is not None:
+            omm = cache_omega_m(d["scalars"][None], meta["cache_attrs"])
+            w = torch.from_numpy(node_weight(np.atleast_1d(d["z"]), omm, node["w_mode"]))
+        scal = node_scalars(scal, w, node)
         truth = d["xhi"].astype(np.float64)
         with torch.no_grad():
             out, states = model(cond, scal, return_states=True)
+            out = node_output(out, w, node)
             forcing = model.lift(cond) + model.scalar_embed(scal)[:, :, None, None]
             factors = [inter.factors(s, forcing) for s in states[:-1]]
         pred = out[0, 0].sigmoid().numpy()

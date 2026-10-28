@@ -39,6 +39,39 @@ DEFAULT_PARAM_NAMES = (
 )
 
 
+# 21cmFAST's coeval node redshifts, (1 + z_n) = 5 * 1.02^n for n = 0..100, and h: identical in every cone of the
+# suite (all 6,600 raw files' lightcone/node_redshifts agree to 2e-14; hlittle = 0.6766 in all of them).
+NODE_REDSHIFTS = 5.0 * 1.02 ** np.arange(101) - 1.0
+HLITTLE = 0.6766
+W_MODES = ("chi", "z")
+
+
+def node_weight(z, omega_m=None, mode="chi", nodes=NODE_REDSHIFTS, h=HLITTLE):
+    """Interpolation weight w in [0, 1) of lightcone slices between their two bracketing coeval nodes.
+
+    21cmFAST builds a slice at z_b < z <= z_a (a: the earlier, higher-z node) as x = (1 - w) X_a + w X_b, so w = 0
+    at node a and w -> 1 towards node b. ``mode="chi"``: linear in comoving distance,
+    w = (chi(z_a) - chi(z)) / (chi(z_a) - chi(z_b)), with the cone's ``omega_m`` (scalar or one per slice) and ``h``
+    (c/H0 cancels; h only sets the radiation density); ``mode="z"``: linear in redshift. Outside the node range
+    w is clipped to [0, 1].
+    """
+    if mode not in W_MODES:
+        raise ValueError(f"w mode must be one of {W_MODES}")
+    z = np.asarray(z, dtype=np.float64)
+    zn = np.sort(np.asarray(nodes, dtype=np.float64))
+    i = np.clip(np.searchsorted(zn, z, side="left"), 1, len(zn) - 1)
+    z_a, z_b = zn[i], zn[i - 1]
+    if mode == "z":
+        return np.clip((z_a - z) / (z_a - z_b), 0.0, 1.0)
+    omega_m = np.broadcast_to(np.asarray(omega_m, dtype=np.float64), z.shape)
+    w = np.empty_like(z)
+    for om in np.unique(omega_m):
+        sel = omega_m == om
+        cosmo = FlatLCDM(om, h)
+        w[sel] = cosmo.distance_between(z[sel], z_a[sel]) / cosmo.distance_between(z_b[sel], z_a[sel])
+    return np.clip(w, 0.0, 1.0)
+
+
 def _scalar(v):
     return v.item() if isinstance(v, np.generic) else v
 
@@ -119,6 +152,11 @@ class Lightcone:
     @property
     def cell_size(self) -> float:
         return self.box_len / self.shape_hw[0]
+
+    @property
+    def node_redshifts(self) -> np.ndarray:
+        """The coeval node redshifts the cone was interpolated between (raw_v2 only), increasing."""
+        return np.sort(np.asarray(self._f["lightcone/node_redshifts"], dtype=np.float64))
 
     # ------------------------------------------------------------ params
     def _param_groups(self):

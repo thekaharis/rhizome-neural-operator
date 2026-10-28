@@ -1,8 +1,8 @@
 """Flat LCDM comoving distance and its inverse, without astropy.
 
-Used only to label native py21cmfast lightcones, which store comoving
-distances but no redshift axis. Raw-v2 files carry their own redshifts and
-never go through this module.
+Used to label native py21cmfast lightcones, which store comoving distances
+but no redshift axis (raw-v2 files carry their own redshifts), and for the
+node interpolation weight of lightcone slices (``data.lightcone.node_weight``).
 
 py21cmfast (4.x) builds its cosmology as astropy's Planck15 cloned with the
 file's H0, Om0, Ob0 and Neff=3.044, i.e. T_cmb = 2.7255 K and neutrino masses
@@ -13,6 +13,8 @@ shifts z by ~1e-2 (radiation) to ~0.5 (massive neutrinos) at z ~ 30.
 """
 
 from __future__ import annotations
+
+from functools import cached_property
 
 import numpy as np
 
@@ -42,12 +44,15 @@ class FlatLCDM:
         self._nu_y = m_nu[m_nu > 0] / (_KB_EV * t_nu) if t_cmb > 0 else np.zeros(0)
         self.omega_nu = self.omega_gamma * self._nu_rel(0.0)
         self.omega_l = 1.0 - self.omega_m - self.omega_gamma - self.omega_nu
+        self._z_max, self._n_grid = z_max, n_grid
 
-        z = np.linspace(0.0, z_max, n_grid)
+    @cached_property
+    def _table(self):
+        """(z, comoving distance) on the interpolation grid, built on first use."""
+        z = np.linspace(0.0, self._z_max, self._n_grid)
         inv_e = 1.0 / self._e(z)
         cum = np.concatenate([[0.0], np.cumsum(0.5 * (inv_e[1:] + inv_e[:-1]) * np.diff(z))])
-        self._z = z
-        self._d = cum * C_KM_S / (100.0 * self.h)
+        return z, cum * C_KM_S / (100.0 * self.h)
 
     def _nu_rel(self, z):
         """rho_nu / rho_gamma, astropy FLRW.nu_relative_density."""
@@ -66,10 +71,21 @@ class FlatLCDM:
 
     def comoving_distance(self, z) -> np.ndarray:
         """Comoving distance in Mpc (not Mpc/h)."""
-        return np.interp(np.asarray(z, dtype=np.float64), self._z, self._d)
+        return np.interp(np.asarray(z, dtype=np.float64), *self._table)
+
+    def distance_between(self, z1, z2, order=16) -> np.ndarray:
+        """Comoving distance from z1 to z2 in Mpc by Gauss-Legendre quadrature, without the table.
+
+        Exact to rounding for intervals over which 1/E(z) is smooth (e.g. one 21cmFAST node step)."""
+        z1, z2 = np.asarray(z1, dtype=np.float64), np.asarray(z2, dtype=np.float64)
+        x, weight = np.polynomial.legendre.leggauss(order)
+        half, mid = 0.5 * (z2 - z1), 0.5 * (z2 + z1)
+        inv_e = 1.0 / self._e(mid[..., None] + half[..., None] * x)
+        return half * (inv_e @ weight) * C_KM_S / (100.0 * self.h)
 
     def z_at_distance(self, d) -> np.ndarray:
         d = np.asarray(d, dtype=np.float64)
-        if np.any(d < 0) or np.any(d > self._d[-1]):
+        z, dist = self._table
+        if np.any(d < 0) or np.any(d > dist[-1]):
             raise ValueError("distance outside the tabulated range")
-        return np.interp(d, self._d, self._z)
+        return np.interp(d, dist, z)
