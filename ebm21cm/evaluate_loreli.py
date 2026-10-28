@@ -29,15 +29,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import h5py
 import numpy as np
+import torch
 
 from . import loreli_metrics as lm
-from .data.loreli import LoreliAdapter, LoreliCone, loreli_files, training_stats
-from .loreli_inference import load_model, map_to_native, predict_cone
+from .data.loreli import LoreliAdapter, LoreliCone, loreli_files, read_cube, training_stats
+from .loreli_inference import border_mask, downsample_transverse, load_model, map_to_native, predict_cone, predict_targets
 
 SIGMAS = (0.0, 2.3, 4.7)
 CURVE = (0.0, 0.5, 1.0, 1.5, 2.3, 3.0, 4.0, 4.7, 6.0, 8.0)
@@ -187,6 +190,54 @@ def borders(keep):
     return int(min(row, col))
 
 
+def fingerprint(args, best):
+    """Config signature stored with each cone so a resume cannot mix selections."""
+    return {"run": str(args.run.resolve()), "step": best.get("step"), "cache": str(args.cache.resolve()),
+            "l_perp": args.l_perp, "border": args.border, "los_margin": args.los_margin,
+            "slice_stride": args.slice_stride, "min_per_stage": args.min_per_stage,
+            "density_mean": args.density_mean, "velocity": args.velocity,
+            "n_native": args.n_native, "n_los": args.n_los,
+            "z_range": list(args.z_range), "z_window": list(args.z_window) if args.z_window else None}
+
+
+def select_targets(adapter, cone, truth_x, stride, min_per_stage):
+    """Stage-stratified target indices: every ``stride``-th slice in each stage, at least ``min_per_stage``."""
+    if stride <= 1:
+        return None
+    position = np.interp(adapter.target_distance, cone.distances, np.arange(cone.n_los))
+    native = np.rint(position).astype(np.int64).clip(0, cone.n_los - 1)
+    means = truth_x.reshape(-1, cone.n_los)[:, native].mean(0)
+    stages = np.array([lm.stage_of(float(m)) for m in means])
+    selected = []
+    for name, _, _ in lm.STAGES:
+        js = np.flatnonzero(stages == name)
+        if len(js) == 0:
+            continue
+        count = min(len(js), max(int(min_per_stage), int(np.ceil(len(js) / stride))))
+        pick = np.unique(np.linspace(0, len(js) - 1, count).round().astype(int))
+        selected += js[pick].tolist()
+    if not selected:
+        raise ValueError("slice stride selected no active target slices")
+    return np.sort(np.asarray(selected, dtype=np.int64))
+
+
+def map_selected(adapter, cone, xhi, tb, targets, predicted):
+    """Downsample selected predictions and assign each to the nearest native slice."""
+    px = downsample_transverse(xhi, adapter, cone)
+    pt = downsample_transverse(tb, adapter, cone)
+    position = np.interp(adapter.target_distance, cone.distances, np.arange(cone.n_los))
+    native = np.rint(position[targets]).astype(np.int64).clip(0, cone.n_los - 1)
+    shape = (len(cone.z), cone.n_native, cone.n_native)
+    out_x = np.full(shape, np.nan, np.float32)
+    out_t = np.full(shape, np.nan, np.float32)
+    for j, i in enumerate(native):
+        if not cone.valid[i]:
+            continue
+        out_x[i], out_t[i] = px[j], pt[j]
+        predicted[i] = True
+    return out_x, out_t
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--run", type=Path, required=True, help="slice-wise mf2d run directory (best.pt)")
@@ -199,8 +250,18 @@ def main(argv=None):
     ap.add_argument("--density-mean", choices=("slice", "cone"), default="slice")
     ap.add_argument("--velocity", choices=("linear", "zero"), default="linear")
     ap.add_argument("--border", type=int, default=0, help="discard this many resampled cells at the domain edge")
+    ap.add_argument("--los-margin", type=int, default=0,
+                    help="exclude this many native slices at each valid end from the metrics (their LOS bands "
+                         "are edge-replicated); predictions are still written")
+    ap.add_argument("--slice-stride", type=int, default=1,
+                    help="stage-stratified model stride: keep about 1/N of the active slices per stage (1 = all)")
+    ap.add_argument("--min-per-stage", type=int, default=8,
+                    help="keep at least this many slices per stage when --slice-stride > 1")
+    ap.add_argument("--resume", action="store_true", help="skip cones whose per-cone pickle is already present")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--force-torch-inputs", action="store_true",
+                    help="debug: run the torch input path even on CPU (it is implied by --device cuda)")
     ap.add_argument("--shape-per-stage", type=int, default=48,
                     help="slices per stage for bubble/front/PDF/curve metrics (0 = all)")
     ap.add_argument("--baseline-per-stage", type=int, default=32,
@@ -212,15 +273,12 @@ def main(argv=None):
     ap.add_argument("--z-range", type=float, nargs=2, default=(5.0, 15.0), help="debug/synthetic: LOS redshift range")
     ap.add_argument("--z-window", type=float, nargs=2, default=None,
                     help="evaluate only this redshift window (e.g. 8.5 8.7 for a quick real-data check)")
-    ap.add_argument("--los-margin", type=int, default=0,
-                    help="exclude this many native slices at each valid end from the metrics (their LOS bands "
-                         "are edge-replicated); predictions are still written")
     args = ap.parse_args(argv)
+    if args.slice_stride < 1 or args.min_per_stage < 1:
+        ap.error("--slice-stride and --min-per-stage must be >= 1")
     args.out.mkdir(parents=True, exist_ok=True)
     stats = training_stats(args.cache)
     native, model, best = load_model(args.run)
-    import torch
-
     device = torch.device(args.device)
     model = model.to(device)
     files, sims = loreli_files(args.data)
@@ -231,90 +289,133 @@ def main(argv=None):
         files = files[:args.limit]
     if not files:
         raise SystemExit("no cones selected")
-    print(f"{len(files)} cones, {len(stats['bands'])} bands, checkpoint step {best.get('step')}; "
-          f"scalars = oracle histories + training-mean parameters; los margin {args.los_margin}", flush=True)
+    fp = fingerprint(args, best)
 
     totals = {name: Accumulator() for name, _, _ in lm.STAGES}
     per_cone = []
-    for k, path in enumerate(files):
-        sim = int(path.stem.split("simu")[-1])
-        target = args.out / f"cone_{sim}.json"
-        started = time.time()
-        cone = LoreliCone(path, l_perp=args.l_perp, density_mean=args.density_mean,
-                          n_native=args.n_native, n_los=args.n_los, z_range=tuple(args.z_range))
-        if args.z_window is not None:
-            cone.valid &= (cone.z >= args.z_window[0]) & (cone.z <= args.z_window[1])
-            cone.n_slices = int(cone.valid.sum())
-            if not cone.n_slices:
-                raise SystemExit(f"{path}: no valid slices in z window {args.z_window}")
-        adapter = LoreliAdapter(cone, stats, velocity=args.velocity)
-        xhi, tb = predict_cone(adapter, model, best, device, args.batch_size)
-        pred_x, pred_tb, keep = map_to_native(xhi, tb, adapter, cone, args.border)
-        border = borders(keep)
-        crop = slice(border, cone.n_native - border)
-        raw = cone.read(0, cone.n_los)
-        truth_x = 1.0 - raw["xion"]
-        truth_tb = raw["dtb"]
-        delta = cone.delta(raw["dens"])
-        cell = cone.l_perp / cone.n_native
-        stages = {name: Accumulator() for name, _, _ in lm.STAGES}
-        active = {name: [] for name in stages}
-        valid = np.flatnonzero(cone.valid)
-        edge = set(valid[:args.los_margin]) | set(valid[-args.los_margin:]) if args.los_margin else set()
-        for i in valid:
-            if i in edge:
-                continue
-            true = truth_x[crop, crop, i]
-            stage = lm.stage_of(float(true.mean()))
-            if stage is None:
-                continue
-            active[stage].append(int(i))
-            stages[stage].add_slice(pred_x[i, crop, crop], true, pred_tb[i, crop, crop], truth_tb[crop, crop, i], cell)
-        for name, idx in active.items():
-            for i in select(idx, args.shape_per_stage):
+    if args.resume:
+        for pkl in sorted(args.out.glob("cone_*.pkl")):
+            payload = pickle.loads(pkl.read_bytes())
+            if payload.get("fingerprint") != fp:
+                raise SystemExit(f"{pkl}: resume config differs from this command; use a fresh --out")
+            for name in totals:
+                totals[name].merge(payload["stages"][name])
+            per_cone.append(payload["record"])
+        done = {int(r["sim"]) for r in per_cone}
+        files = [p for p in files if int(p.stem.split("simu")[-1]) not in done]
+        print(f"resume: {len(per_cone)} cones already done, {len(files)} to go", flush=True)
+    print(f"{len(files)} cones to evaluate, {len(stats['bands'])} bands, checkpoint step {best.get('step')}; "
+          f"stride {args.slice_stride} (min {args.min_per_stage}/stage), LOS margin {args.los_margin}, "
+          f"device {device}; scalars = oracle histories + training-mean parameters", flush=True)
+
+    def load(path):
+        return read_cube(path)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(load, files[0]) if files else None
+        for k, path in enumerate(files):
+            sim = int(path.stem.split("simu")[-1])
+            target = args.out / f"cone_{sim}.json"
+            started = time.time()
+            data = future.result()
+            if k + 1 < len(files):
+                future = pool.submit(load, files[k + 1])
+            cone = LoreliCone(path, l_perp=args.l_perp, density_mean=args.density_mean, n_native=args.n_native,
+                              n_los=args.n_los, z_range=tuple(args.z_range), data=data)
+            if args.z_window is not None:
+                cone.valid &= (cone.z >= args.z_window[0]) & (cone.z <= args.z_window[1])
+                cone.n_slices = int(cone.valid.sum())
+                if not cone.n_slices:
+                    raise SystemExit(f"{path}: no valid slices in z window {args.z_window}")
+            adapter = LoreliAdapter(cone, stats, velocity=args.velocity, device=device,
+                                    force_torch=args.force_torch_inputs)
+            raw = cone.read(0, cone.n_los)
+            truth_x = 1.0 - raw["xion"]
+            truth_tb = raw["dtb"]
+            delta = cone.delta(raw["dens"])
+            targets = select_targets(adapter, cone, truth_x, args.slice_stride, args.min_per_stage)
+            predicted = np.zeros(cone.n_los, bool)
+            if targets is None:
+                xhi, tb = predict_cone(adapter, model, best, device, args.batch_size)
+                pred_x, pred_tb, keep = map_to_native(xhi, tb, adapter, cone, args.border)
+                predicted[cone.valid] = True
+            else:
+                xhi, tb, targets = predict_targets(adapter, model, best, device, args.batch_size, targets)
+                pred_x, pred_tb = map_selected(adapter, cone, xhi, tb, targets, predicted)
+                keep = None
+            if keep is None:
+                keep = border_mask(adapter, cone, args.border)
+            border = borders(keep)
+            crop = slice(border, cone.n_native - border)
+            stages = {name: Accumulator() for name, _, _ in lm.STAGES}
+            active = {name: [] for name in stages}
+            valid = np.flatnonzero(cone.valid)
+            edge = set(valid[:args.los_margin]) | set(valid[-args.los_margin:]) if args.los_margin else set()
+            for i in valid:
+                if i in edge or not predicted[i]:
+                    continue
                 true = truth_x[crop, crop, i]
-                stages[name].add_shape(pred_x[i, crop, crop], true, pred_tb[i, crop, crop], truth_tb[crop, crop, i], cell)
-            if not args.no_baselines:
-                delta_slice = delta[crop, crop]
-                for i in select(idx, args.baseline_per_stage or args.shape_per_stage):
+                stage = lm.stage_of(float(true.mean()))
+                if stage is None:
+                    continue
+                active[stage].append(int(i))
+                stages[stage].add_slice(pred_x[i, crop, crop], true, pred_tb[i, crop, crop],
+                                        truth_tb[crop, crop, i], cone.l_perp / cone.n_native)
+            for name, idx in active.items():
+                for i in select(idx, args.shape_per_stage):
                     true = truth_x[crop, crop, i]
-                    score = delta_slice[:, :, i]
-                    fraction = float((true < 0.5).mean())
-                    if not 0 < fraction < 1:
-                        continue
-                    threshold = np.quantile(score, 1 - fraction)
-                    stages[name].add_baseline("density", np.where(score >= threshold, 0.0, 1.0), true)
-                    es = lm.sharp_k_max(score, cell)
-                    threshold = np.quantile(es, 1 - fraction)
-                    stages[name].add_baseline("excursion", np.where(es >= threshold, 0.0, 1.0), true)
-        record = {"sim": sim, "path": str(path), "l_perp": args.l_perp, "density_mean": args.density_mean,
-                  "velocity": args.velocity, "border": args.border, "los_margin": args.los_margin,
-                  "n_valid": int(cone.n_slices), "n_edge_excluded": len(edge),
-                  "scalars": {"histories": "oracle (cone's own x_HI/T_b band means)",
-                              "parameters": "training mean (normalized zero)"},
-                  "n_active": {name: len(idx) for name, idx in active.items()},
-                  "stages": {name: stages[name].metrics() for name in stages},
-                  "seconds": round(time.time() - started, 1)}
-        if args.save_cones:
-            with h5py.File(args.out / f"cone_{sim}.h5", "w") as f:
-                f.create_dataset("xhi", data=pred_x.astype(np.float16), compression="gzip", compression_opts=4)
-                f.create_dataset("tb", data=pred_tb.astype(np.float16), compression="gzip", compression_opts=4)
-                f.create_dataset("valid", data=cone.valid)
-                f.create_dataset("z", data=cone.z)
-                f.attrs.update({"sim": sim, "checkpoint": str((args.run / "best.pt").resolve()),
-                                "border": args.border, "grid": "native 128, increasing z"})
-        target.write_text(json.dumps(record, indent=1))
-        per_cone.append(record)
-        for name in totals:
-            totals[name].merge(stages[name])
-        print(f"[{k + 1}/{len(files)}] {sim}: {record['seconds']} s, "
-              + "  ".join(f"{name} n={record['n_active'][name]} "
-                          f"rmse={record['stages'][name]['xhi_rmse']['0.0']:.4f} "
-                          f"iou={record['stages'][name]['iou_matched']:.3f}" for name in stages), flush=True)
+                    stages[name].add_shape(pred_x[i, crop, crop], true, pred_tb[i, crop, crop],
+                                           truth_tb[crop, crop, i], cone.l_perp / cone.n_native)
+                if not args.no_baselines:
+                    delta_slice = delta[crop, crop]
+                    for i in select(idx, args.baseline_per_stage or args.shape_per_stage):
+                        true = truth_x[crop, crop, i]
+                        score = delta_slice[:, :, i]
+                        fraction = float((true < 0.5).mean())
+                        if not 0 < fraction < 1:
+                            continue
+                        threshold = np.quantile(score, 1 - fraction)
+                        stages[name].add_baseline("density", np.where(score >= threshold, 0.0, 1.0), true)
+                        es = lm.sharp_k_max(score, cone.l_perp / cone.n_native)
+                        threshold = np.quantile(es, 1 - fraction)
+                        stages[name].add_baseline("excursion", np.where(es >= threshold, 0.0, 1.0), true)
+            record = {"sim": sim, "path": str(path), "l_perp": args.l_perp, "density_mean": args.density_mean,
+                      "velocity": args.velocity, "border": args.border, "los_margin": args.los_margin,
+                      "slice_stride": args.slice_stride, "min_per_stage": args.min_per_stage,
+                      "n_valid": int(cone.n_slices), "n_predicted": int(predicted.sum()),
+                      "n_edge_excluded": len(edge), "n_targets": None if targets is None else int(len(targets)),
+                      "scalars": {"histories": "oracle (cone's own x_HI/T_b band means)",
+                                  "parameters": "training mean (normalized zero)"},
+                      "n_active": {name: len(idx) for name, idx in active.items()},
+                      "stages": {name: stages[name].metrics() for name in stages},
+                      "seconds": round(time.time() - started, 1)}
+            if args.save_cones:
+                with h5py.File(args.out / f"cone_{sim}.h5", "w") as f:
+                    f.create_dataset("xhi", data=pred_x.astype(np.float16), compression="gzip", compression_opts=4)
+                    f.create_dataset("tb", data=pred_tb.astype(np.float16), compression="gzip", compression_opts=4)
+                    f.create_dataset("valid", data=cone.valid)
+                    f.create_dataset("predicted", data=predicted)
+                    f.create_dataset("z", data=cone.z)
+                    if targets is not None:
+                        f.create_dataset("target_index", data=targets)
+                    f.attrs.update({"sim": sim, "checkpoint": str((args.run / "best.pt").resolve()),
+                                    "border": args.border, "los_margin": args.los_margin,
+                                    "slice_stride": args.slice_stride, "grid": "native 128, increasing z"})
+            target.write_text(json.dumps(record, indent=1))
+            pickle.dump({"fingerprint": fp, "record": record, "stages": stages},
+                        (args.out / f"cone_{sim}.pkl").open("wb"))
+            per_cone.append(record)
+            for name in totals:
+                totals[name].merge(stages[name])
+            print(f"[{k + 1}/{len(files)}] {sim}: {record['seconds']} s, "
+                  + "  ".join(f"{name} n={record['n_active'][name]} "
+                              f"rmse={record['stages'][name]['xhi_rmse']['0.0']:.4f} "
+                              f"iou={record['stages'][name]['iou_matched']:.3f}" for name in stages), flush=True)
 
     summary = {"run": str(args.run.resolve()), "data": str(args.data.resolve()), "cache": str(args.cache.resolve()),
                "checkpoint_step": best.get("step"), "l_perp": args.l_perp, "density_mean": args.density_mean,
                "velocity": args.velocity, "border": args.border, "los_margin": args.los_margin,
+               "slice_stride": args.slice_stride, "min_per_stage": args.min_per_stage,
                "n_cones": len(per_cone),
                "scalars": {"histories": "oracle (cone's own x_HI/T_b band means)",
                            "parameters": "training mean (normalized zero)"},
@@ -328,7 +429,8 @@ def write_markdown(path, summary):
     lines = [f"# LoReLi zero-shot: {Path(summary['run']).name}", "",
              f"{summary['n_cones']} cones, L_perp = {summary['l_perp']:.0f} Mpc, "
              f"density mean = {summary['density_mean']}, velocity = {summary['velocity']}, border = {summary['border']}, "
-             f"LOS margin = {summary['los_margin']}",
+             f"LOS margin = {summary['los_margin']}, slice stride = {summary['slice_stride']} "
+             f"(min {summary['min_per_stage']}/stage)",
              "",
              "Scalars are the cone's own (oracle) histories and the training-mean parameters; the numbers are therefore "
              "a history-conditioned upper bound, not a parameter-marginalized score. The first/last `--los-margin` "

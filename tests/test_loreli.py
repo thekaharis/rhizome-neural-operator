@@ -135,6 +135,17 @@ def test_adapter_shapes_and_scalars(tmp_path):
     assert np.allclose(inputs["cond"][:, len(STATS["bands"]):], 0.0)
 
 
+def test_torch_input_path_matches_the_numpy_path(tmp_path):
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00006.dat"
+    write_cone(path, n_native=16, n_los=32, tail=4)
+    cone = LoreliCone(path, z_range=(5.0, 5.4), n_native=16, n_los=32)
+    numpy_inputs = LoreliAdapter(cone, STATS, velocity="zero").inputs(2, 5)
+    torch_inputs = LoreliAdapter(cone, STATS, velocity="zero", force_torch=True).inputs(2, 5)
+    assert np.allclose(numpy_inputs["cond"], torch_inputs["cond"].numpy(), atol=1e-5)
+    assert np.allclose(numpy_inputs["phys"], torch_inputs["phys"].numpy(), atol=1e-5)
+    assert np.allclose(numpy_inputs["scalars"], torch_inputs["scalars"], atol=1e-6)
+
+
 def test_area_matrix_rows_sum_to_one():
     weights = area_matrix(128, 206)
     assert weights.shape == (128, 206)

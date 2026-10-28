@@ -73,12 +73,55 @@ def predict_cone(adapter, model, best, device="cuda", batch=16, progress=None):
     return xhi, tb
 
 
+def _concat(parts):
+    return torch.cat(parts) if isinstance(parts[0], torch.Tensor) else np.concatenate(parts)
+
+
+def predict_targets(adapter, model, best, device="cuda", batch=16, targets=None):
+    """Predict a sorted subset of target indices; (x_HI, T_b, targets).
+
+    Contiguous runs are built as one adapter batch and concatenated until the
+    model batch is full, so a stage-stratified stride does not degenerate into
+    batch-size-1 forwards.
+    """
+    targets = np.asarray(targets, dtype=np.int64)
+    if targets.size == 0:
+        raise ValueError("empty target selection")
+    groups = np.split(targets, np.flatnonzero(np.diff(targets) > 1) + 1)
+    xs, ts, pending = [], [], []
+
+    def flush():
+        nonlocal pending
+        if not pending:
+            return
+        inputs = {key: _concat([p[key] for p in pending]) for key in ("cond", "scalars", "phys")}
+        x, t = predict(model, inputs, best, device)
+        xs.append(x)
+        ts.append(t)
+        pending = []
+
+    for group in groups:
+        inputs = adapter.inputs(int(group[0]), int(group[-1]) + 1)
+        pending.append(inputs)
+        if sum(len(p["z"]) for p in pending) >= batch:
+            flush()
+    flush()
+    return np.concatenate(xs), np.concatenate(ts), targets
+
+
 def downsample_transverse(planes, adapter, cone):
     """Crop the 280-cell domain to the valid n_out plane and area-average to the native grid."""
     start = (adapter.domain - adapter.n_out) // 2
     planes = planes[..., start:start + adapter.n_out, start:start + adapter.n_out]
     weights = area_matrix(cone.n_native, adapter.n_out)
     return np.einsum("ij,...jk,lk->...il", weights, planes, weights, optimize=True).astype(np.float32)
+
+
+def border_mask(adapter, cone, border=0):
+    """Transverse mask: native cell centres at least ``border`` resampled cells from the plane edge."""
+    x = (np.arange(cone.n_native) + 0.5) * (cone.l_perp / cone.n_native)
+    edge = np.minimum(x, cone.l_perp - x)
+    return np.minimum(edge[:, None], edge[None, :]) >= border * (cone.l_perp / adapter.n_out)
 
 
 def map_to_native(xhi, tb, adapter, cone, border=0):
@@ -100,7 +143,4 @@ def map_to_native(xhi, tb, adapter, cone, border=0):
     out_t = np.full(shape, np.nan, np.float32)
     out_x[valid] = xhi[i0] * (1 - t) + xhi[i1] * t
     out_t[valid] = tb[i0] * (1 - t) + tb[i1] * t
-    x = (np.arange(cone.n_native) + 0.5) * (cone.l_perp / cone.n_native)
-    edge = np.minimum(x, cone.l_perp - x)
-    keep = np.minimum(edge[:, None], edge[None, :]) >= border * (cone.l_perp / adapter.n_out)
-    return out_x, out_t, keep
+    return out_x, out_t, border_mask(adapter, cone, border)

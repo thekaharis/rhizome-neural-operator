@@ -90,9 +90,9 @@ def pad_to(plane, size=DOMAIN):
     return mirror_pad(mirror_pad(plane, py, 0), px, 1)
 
 
-def _grid(n_in, n_out):
+def _grid(n_in, n_out, device="cpu"):
     """``grid_sample`` coordinates mapping cell centres of n_in to n_out (align_corners=False)."""
-    t = (torch.arange(n_out, dtype=torch.float32) + 0.5) * (2.0 / n_out) - 1.0
+    t = (torch.arange(n_out, dtype=torch.float32, device=device) + 0.5) * (2.0 / n_out) - 1.0
     return torch.stack([t[None, :].expand(n_out, n_out), t[:, None].expand(n_out, n_out)], -1)[None]
 
 
@@ -107,6 +107,36 @@ def resample_transverse(plane, n_out):
     out = F.grid_sample(y, _grid(plane.shape[0], n_out).expand(y.shape[0], -1, -1, -1),
                         mode="bicubic", padding_mode="reflection", align_corners=False)
     return out[:, 0].permute(1, 2, 0).numpy()
+
+
+def resample_transverse_torch(plane, n_out, device="cuda"):
+    """GPU version of :func:`resample_transverse`; returns a (n_out, n_out, n) tensor on ``device``."""
+    y = torch.as_tensor(plane, dtype=torch.float32, device=device).permute(2, 0, 1)[:, None]
+    out = F.grid_sample(y, _grid(plane.shape[0], n_out, device).expand(y.shape[0], -1, -1, -1),
+                        mode="bicubic", padding_mode="reflection", align_corners=False)
+    return out[:, 0].permute(1, 2, 0)
+
+
+def band_planes_torch(values, centers, bands):
+    """GPU/torch version of :func:`band_planes`; ``values`` is (H, W, n) and float64 cumsum is kept."""
+    csum = torch.cumsum(values.to(torch.float64), -1)
+    csum = torch.cat([torch.zeros(values.shape[:2] + (1,), dtype=torch.float64, device=values.device), csum], -1)
+    lo = torch.tensor([b[0] for b in bands], device=values.device)
+    hi = torch.tensor([b[1] for b in bands], device=values.device)
+    c = torch.as_tensor(centers, device=values.device)[:, None]
+    out = (csum[..., c + hi] - csum[..., c + lo]) / (hi - lo).to(torch.float64)
+    return out.permute(2, 3, 0, 1).to(torch.float32)
+
+
+def pad_to_torch(plane, size=DOMAIN):
+    """GPU/torch version of :func:`pad_to`."""
+    ny, nx = plane.shape[:2]
+    if ny > size or nx > size:
+        raise ValueError(f"plane {plane.shape[:2]} does not fit {size}x{size}")
+    py, px = (size - ny) // 2, (size - nx) // 2
+    iy = torch.as_tensor(_mirror_index(ny, py), device=plane.device)
+    ix = torch.as_tensor(_mirror_index(nx, px), device=plane.device)
+    return plane.index_select(0, iy).index_select(1, ix)
 
 
 def resample_los(cube, distance, target_distance):
@@ -166,6 +196,21 @@ def velocity_shape(delta, cell=TRAINING_CELL_MPC, cell_los=None):
                          s=(ny, nx, nz), axes=(0, 1, 2)).astype(np.float32)
 
 
+def velocity_shape_torch(delta, cell=TRAINING_CELL_MPC, cell_los=None, device="cuda"):
+    """GPU version of :func:`velocity_shape`; returns the same float32 array on the host."""
+    d = torch.as_tensor(delta, dtype=torch.float32, device=device)
+    ny, nx, nz = d.shape
+    cell_los = cell if cell_los is None else cell_los
+    kx = 2 * torch.pi * torch.fft.fftfreq(ny, d=cell, device=device)
+    ky = 2 * torch.pi * torch.fft.fftfreq(nx, d=cell, device=device)
+    kz = 2 * torch.pi * torch.fft.rfftfreq(nz, d=cell_los, device=device)
+    k2 = (kx[:, None, None] ** 2 + ky[None, :, None] ** 2 + kz[None, None, :] ** 2).to(torch.float32)
+    k2[0, 0, 0] = 1.0
+    spectrum = torch.fft.rfftn(d)
+    field = (1j * kz[None, None, :] * spectrum / k2).to(torch.complex64)
+    return torch.fft.irfftn(field, s=(ny, nx, nz)).cpu().numpy().astype(np.float32)
+
+
 def linear_velocity(delta, z, cell=TRAINING_CELL_MPC, cell_los=None, omega_m=LORELI_OMEGA_M, h=LORELI_H):
     """Linear-theory LOS velocity in the 21cmFAST training convention (comoving Mpc/s).
 
@@ -183,11 +228,23 @@ def amplitude(z, omega_m=LORELI_OMEGA_M, h=LORELI_H):
         0.15 / (omega_m * h ** 2) * (1 + np.asarray(z, np.float64)) / 10.0)
 
 
+def read_cube(path):
+    """Read one five-field file contiguously (a single 480 MB sequential read)."""
+    return np.fromfile(path, dtype="<f4")
+
+
 class LoreliCone:
-    """One memory-mapped five-field cone; index 0 is the low-redshift end."""
+    """One five-field cone in RAM; index 0 is the low-redshift end.
+
+    The 480 MB file is read once, contiguously, and all field accesses are then
+    from RAM. Repeated strided memmap reads of the interleaved field axis were
+    the dominant cost of the first evaluation (several full-file passes per
+    cone on a cold cache); a caller that prefetches can pass the flat array as
+    ``data``.
+    """
 
     def __init__(self, path, l_perp=LORELI_L_PERP, z_range=LORELI_Z, omega_m=LORELI_OMEGA_M, h=LORELI_H,
-                 density_mean="slice", n_native=LORELI_NATIVE, n_los=LORELI_N_LOS):
+                 density_mean="slice", n_native=LORELI_NATIVE, n_los=LORELI_N_LOS, data=None):
         if float(l_perp) not in (294.0, 300.0):
             raise ValueError("l_perp must be 294 or 300 Mpc (the two published values)")
         if density_mean not in ("slice", "cone"):
@@ -196,8 +253,13 @@ class LoreliCone:
         self.sim = int(re.findall(r"\d+", self.path.stem)[-1])
         self.l_perp, self.density_mean = float(l_perp), density_mean
         self.n_native, self.n_los = int(n_native), int(n_los)
-        self.data = np.memmap(self.path, dtype="<f4", mode="r").reshape(
-            self.n_native, self.n_native, self.n_los, len(FIELDS))
+        shape = (self.n_native, self.n_native, self.n_los, len(FIELDS))
+        if data is None:
+            data = read_cube(self.path)
+        data = np.asarray(data, dtype=np.float32)
+        if data.size != int(np.prod(shape)):
+            raise ValueError(f"{self.path}: {data.size} values, expected {int(np.prod(shape))}")
+        self.data = data.reshape(shape)
         self.z, self.distances = loreli_redshifts(z_range, self.n_los, omega_m, h)
         self.valid, self.n_slices = self._validity()
         if not self.n_slices:
@@ -285,13 +347,23 @@ def training_stats(cache):
 
 
 class LoreliAdapter:
-    """Training-cache-shaped slice inputs for one cone on the 280-cell domain."""
+    """Training-cache-shaped slice inputs for one cone on the 280-cell domain.
 
-    def __init__(self, cone, stats, domain=DOMAIN, velocity="linear", l_perp=None):
+    ``device="cuda"`` builds the transverse resampling, the band means and the
+    domain padding as torch operations on the GPU; the native cube, the LOS
+    interpolation and the scalars stay on the host. The CPU path is exactly the
+    original arithmetic, so a stride-1 CPU run reproduces the pre-optimisation
+    outputs.
+    """
+
+    def __init__(self, cone, stats, domain=DOMAIN, velocity="linear", l_perp=None, device="cpu",
+                 force_torch=False):
         if velocity not in ("linear", "stored", "zero"):
             raise ValueError("velocity must be 'linear', 'stored' or 'zero'")
         self.cone, self.stats, self.domain = cone, stats, int(domain)
         self.velocity = velocity
+        self.device = torch.device(device)
+        self.torch_inputs = bool(force_torch) or self.device.type != "cpu"
         self.bands = stats["bands"]
         self.norm = stats["normalization"]
         self.halo = max(0, -min(lo for lo, _ in self.bands), max(hi for _, hi in self.bands) - 1)
@@ -322,19 +394,23 @@ class LoreliAdapter:
         first, last = np.flatnonzero(self.cone.valid)[[0, -1]]
         lo, hi = max(0, first - self.halo), min(self.cone.n_los, last + self.halo + 1)
         dense = self.cone.delta(self.cone.read(lo, hi, fields=("dens",))["dens"])
-        shape = velocity_shape(dense, cell=self.l_perp / self.cone.n_native,
-                               cell_los=float(np.median(np.diff(self.cone.distances))))
+        if self.device.type == "cuda":
+            shape = velocity_shape_torch(dense, cell=self.l_perp / self.cone.n_native,
+                                         cell_los=float(np.median(np.diff(self.cone.distances))),
+                                         device=self.device)
+        else:
+            shape = velocity_shape(dense, cell=self.l_perp / self.cone.n_native,
+                                   cell_los=float(np.median(np.diff(self.cone.distances))))
         return shape, lo
 
     def _native(self, start, stop):
-        raw = self.cone.read(start, stop)
+        raw = self.cone.read(start, stop, fields=("dens", "los_velocity"))
         velocity = (self._vel_shape[:, :, start - self._vel0:stop - self._vel0]
                     if self.velocity == "linear" else raw["los_velocity"])
-        return {"delta": self.cone.delta(raw["dens"]), "xhi": 1.0 - raw["xion"], "tb": raw["dtb"],
-                "los_velocity": velocity}
+        return {"delta": self.cone.delta(raw["dens"]), "los_velocity": velocity}
 
     def _target(self, a, b):
-        """Resampled fields for target positions [lo, hi) that contain [a, b) plus the band halo."""
+        """Resampled delta and velocity for target positions [lo, hi) that contain [a, b) plus the halo."""
         lo = max(0, a - self.halo)
         hi = min(len(self.target_distance), b + self.halo + 1)
         distance = self.target_distance[lo:hi]
@@ -344,15 +420,21 @@ class LoreliAdapter:
         n0, n1 = max(0, n0), min(self.cone.n_los, n1)
         native = self._native(n0, n1)
         out = {}
-        for key in ("delta", "xhi", "tb", "los_velocity"):
+        for key in ("delta", "los_velocity"):
             value = native[key]
             if value is not None:
-                out[key] = resample_transverse(
-                    resample_los(value, self.cone.distances[n0:n1], distance), self.n_out)
+                los = resample_los(value, self.cone.distances[n0:n1], distance)
+                out[key] = (resample_transverse_torch(los, self.n_out, self.device)
+                            if self.torch_inputs else resample_transverse(los, self.n_out))
         if self.velocity == "linear":
-            out["los_velocity"] *= hubble_growth(self.z_target[lo:hi]).astype(np.float32)[None, None, :]
+            hf = hubble_growth(self.z_target[lo:hi]).astype(np.float32)
+            if self.torch_inputs:
+                out["los_velocity"] = out["los_velocity"] * torch.as_tensor(hf, device=self.device)[None, None, :]
+            else:
+                out["los_velocity"] *= hf[None, None, :]
         elif self.velocity == "zero":
-            out["los_velocity"] = np.zeros_like(out["delta"])
+            out["los_velocity"] = (torch.zeros_like(out["delta"]) if self.torch_inputs
+                                   else np.zeros_like(out["delta"]))
         elif out.get("los_velocity") is None:
             raise ValueError("stored velocity requested but this cone has none")
         return out, lo, hi
@@ -363,16 +445,26 @@ class LoreliAdapter:
         n = b - a
         centers = np.arange(a, b) - lo + self.halo
         delta, vel = fields["delta"], fields["los_velocity"]
-        delta_p = np.pad(delta, ((0, 0), (0, 0), (self.halo, self.halo)), mode="edge")
-        vel_p = np.pad(vel, ((0, 0), (0, 0), (self.halo, self.halo)), mode="edge")
-        dn, vn = self.norm["density"], self.norm["los_velocity"]
-        cond = np.concatenate([band_planes((delta_p - dn["offset"]) / dn["scale"], centers, self.bands),
-                               band_planes((vel_p - vn["offset"]) / vn["scale"], centers, self.bands)], 1)
-        # Band means commute with the transverse mirror padding: pad the (H, W, C, n) stack once.
-        cond = pad_to(cond.transpose(2, 3, 1, 0), self.domain).transpose(3, 2, 0, 1)
-        phys = pad_to(np.stack([amplitude(z) * (1.0 + delta[:, :, a - lo + i])
-                                for i, z in enumerate(self.z_target[a:b])], -1), self.domain)
-        phys = phys.transpose(2, 0, 1)[:, None]
+        if self.torch_inputs:
+            delta_p = torch.nn.functional.pad(delta, (self.halo, self.halo), mode="replicate")
+            vel_p = torch.nn.functional.pad(vel, (self.halo, self.halo), mode="replicate")
+            dn, vn = self.norm["density"], self.norm["los_velocity"]
+            cond = torch.cat([band_planes_torch((delta_p - dn["offset"]) / dn["scale"], centers, self.bands),
+                              band_planes_torch((vel_p - vn["offset"]) / vn["scale"], centers, self.bands)], 1)
+            cond = pad_to_torch(cond.permute(2, 3, 0, 1), self.domain).permute(2, 3, 0, 1)
+            phys = torch.stack([float(amplitude(z)) * (1.0 + delta[:, :, a - lo + i])
+                                for i, z in enumerate(self.z_target[a:b])], -1)
+            phys = pad_to_torch(phys, self.domain).permute(2, 0, 1)[:, None]
+        else:
+            delta_p = np.pad(delta, ((0, 0), (0, 0), (self.halo, self.halo)), mode="edge")
+            vel_p = np.pad(vel, ((0, 0), (0, 0), (self.halo, self.halo)), mode="edge")
+            dn, vn = self.norm["density"], self.norm["los_velocity"]
+            cond = np.concatenate([band_planes((delta_p - dn["offset"]) / dn["scale"], centers, self.bands),
+                                   band_planes((vel_p - vn["offset"]) / vn["scale"], centers, self.bands)], 1)
+            cond = pad_to(cond.transpose(2, 3, 1, 0), self.domain).transpose(3, 2, 0, 1)
+            phys = pad_to(np.stack([float(amplitude(z)) * (1.0 + delta[:, :, a - lo + i])
+                                    for i, z in enumerate(self.z_target[a:b])], -1), self.domain)
+            phys = phys.transpose(2, 0, 1)[:, None]
         hist_x = band_profile(np.pad(self.history[0][lo:hi], (self.halo, self.halo), mode="edge"),
                               centers, self.bands)
         hist_t = band_profile(np.pad(self.history[1][lo:hi], (self.halo, self.halo), mode="edge"),
@@ -380,5 +472,5 @@ class LoreliAdapter:
         scalars = np.concatenate([(1.0 / (1.0 + self.z_target[a:b]))[:, None],
                                   np.zeros((n, len(self.stats["param_names"])), np.float32),
                                   hist_x, hist_t], 1).astype(np.float32)
-        return {"cond": cond.astype(np.float32), "scalars": scalars, "phys": phys.astype(np.float32),
+        return {"cond": cond, "scalars": scalars, "phys": phys,
                 "z": self.z_target[a:b].astype(np.float32), "target": np.arange(a, b)}
