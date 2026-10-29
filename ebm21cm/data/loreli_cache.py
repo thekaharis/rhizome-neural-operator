@@ -57,7 +57,7 @@ from .loreli import (
     resample_transverse,
     training_stats,
 )
-from .loreli_splits import block_of, load_split
+from .loreli_splits import block_for_split, load_split
 from ..loreli_metrics import stage_of
 from ..run import git_commit
 
@@ -348,7 +348,7 @@ def build(
                     raise ValueError("non-finite cache tensor")
                 if np.abs(arrays["cond"]).max() > 6.0e4 or np.abs(arrays["target"]).max() > 6.0e4:
                     raise ValueError("float16 overflow")
-                block = block_of(sim)
+                block = block_for_split(sim, split)
                 split_name = split["block_to_split"].get(block)
                 split_id = -1 if split_name is None else SPLIT_ID[split_name]
                 values = {

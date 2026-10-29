@@ -1,24 +1,26 @@
 """Parameter-block splits for LoReLi II.
 
-The block is defined by the grid index ``block = (sim_id - 10001) // 6``.  Only
-228 of the 9,828 grid points have five-field files, so the nonempty blocks are
-irregular (95 of them in the current data, some with a single cone).  Binac's
-canonical split is a seed-0 permutation of the nonempty blocks, taking 28 train,
-5 validation and 5 test blocks; the remaining 57 blocks/136 cones are unused.
+The block is defined by the six-aligned grid index
+``block = (sim_id - 10000) // 6``.  The 228 five-field cones form 60 blocks:
+30 complete six-cone groups plus 30 partial groups (23 singletons, 2 pairs,
+1 triple, 2 quadruples, 2 quintuples).  The corrected offset is essential:
+the old ``(sim_id - 10001) // 6`` split real six-cone groups across blocks and
+could leak near-duplicates between train and test.
 
-Cones within one block differ only in the X-ray spectral index, so splitting by
-cone would leak near-duplicates across train/validation/test.
+The canonical v2 split stratifies the 30 full and 30 partial blocks separately
+(22/4/4 each), giving 44 train / 8 validation / 8 test blocks and all 228
+cones.  Train blocks are stored in a deterministic full/small interleave, so
+the nested prefixes 4 ⊂ 8 ⊂ 16 ⊂ 32 ⊂ 44 each contain both group sizes.
 
-The JSON file is written by Binac; this module accepts the explicit schema
+The generator is :mod:`scripts.loreli_block_split`; the JSON schema is
 
-    {"seed": 0, "block_size": 6, "offset": 10001,
-     "train_blocks": [...], "val_blocks": [...], "test_blocks": [...],
-     "blocks": {"0": {"split": "train", "sims": [10001, ...]}, ...}}
+    {"schema": "ebm21cm-loreli-blocksplit-v2",
+     "seed": 0, "rule": "block = (sim_id - 10000) // 6", "offset": 10000,
+     "splits": {"train": {"n_blocks": 44, "n_cones": ..., "blocks": {...}, "sims": [...]}, ...},
+     "stage_slices": {"train": {"xHI_0.05-0.35": ...}, ...}}
 
-and the common shorthand where ``train``/``val``/``test`` are block lists or
-simulation lists, as well as the current ``splits`` schema::
-
-    {"splits": {"train": {"blocks": {"391": [12352], ...}, "sims": [...]}, ...}}
+Older hand-written schemas (top-level ``train``/``val``/``test`` lists or a
+``blocks`` mapping) are still accepted for tests and legacy files.
 """
 
 from __future__ import annotations
@@ -27,20 +29,29 @@ import hashlib
 import json
 from pathlib import Path
 
-BLOCK_OFFSET = 10001
+BLOCK_OFFSET = 10000
 BLOCK_SIZE = 6
-DEFAULT_SPLIT_FILE = "runs/loreli_splits/block_split_seed0.json"
+DEFAULT_SPLIT_FILE = "runs/loreli_splits/block_split_v2_seed0.json"
 SPLIT_NAMES = ("train", "val", "test")
+FULL_BLOCK_SIZE = 6
+V2_SCHEMA = "ebm21cm-loreli-blocksplit-v2"
 
 
 def block_of(sim_id: int) -> int:
-    """Parameter block of a LoReLi simulation id."""
+    """Parameter block of a LoReLi simulation id (6-aligned from 10000)."""
     return (int(sim_id) - BLOCK_OFFSET) // BLOCK_SIZE
 
 
-def sims_of_block(block: int) -> list[int]:
+def block_for_split(sim_id: int, split: dict) -> int:
+    """Block id using the offset recorded in the split file (legacy-safe)."""
+    return (int(sim_id) - int(split.get("offset", BLOCK_OFFSET))) // int(
+        split.get("block_size", BLOCK_SIZE)
+    )
+
+
+def sims_of_block(block: int, offset: int = BLOCK_OFFSET) -> list[int]:
     """Contiguous six grid simulations of a block (fallback when the file has no sim list)."""
-    start = BLOCK_OFFSET + BLOCK_SIZE * int(block)
+    start = int(offset) + BLOCK_SIZE * int(block)
     return list(range(start, start + BLOCK_SIZE))
 
 
@@ -57,7 +68,10 @@ def make_split(sims, seed: int = 0, n_train: int = 28, n_val: int = 5, n_test: i
     import numpy as np
 
     sims = sorted({int(s) for s in sims})
-    blocks = sorted({block_of(s) for s in sims})
+    by_block: dict[int, list[int]] = {}
+    for sim in sims:
+        by_block.setdefault(block_of(sim), []).append(sim)
+    blocks = sorted(by_block)
     if len(blocks) != n_train + n_val + n_test:
         raise ValueError(
             f"expected {n_train + n_val + n_test} blocks, found {len(blocks)}"
@@ -65,8 +79,9 @@ def make_split(sims, seed: int = 0, n_train: int = 28, n_val: int = 5, n_test: i
     order = np.random.default_rng(seed).permutation(blocks).tolist()
     split = {
         "seed": int(seed),
-        "block_size": BLOCK_SIZE,
+        "rule": "block = (sim_id - 10000) // 6",
         "offset": BLOCK_OFFSET,
+        "block_size": BLOCK_SIZE,
         "train_blocks": order[:n_train],
         "val_blocks": order[n_train:n_train + n_val],
         "test_blocks": order[n_train + n_val:],
@@ -74,14 +89,88 @@ def make_split(sims, seed: int = 0, n_train: int = 28, n_val: int = 5, n_test: i
     }
     for name in SPLIT_NAMES:
         for block in split[f"{name}_blocks"]:
-            split["blocks"][str(block)] = {"split": name, "sims": sims_of_block(block)}
+            split["blocks"][str(block)] = {"split": name, "sims": sorted(by_block[block])}
     return split
+
+
+def make_v2_split(sims, seed: int = 0, stage_slices: dict | None = None) -> dict:
+    """Stratified 44/8/8 split over the 60 six-aligned blocks.
+
+    The 30 complete blocks (6 cones) and the 30 incomplete blocks are each
+    permuted with ``default_rng(seed)``; each split takes 22/4/4 of each kind.
+    The train blocks are interleaved full/small, so every prefix used by the
+    learning curve (4, 8, 16, 32, 44) contains both kinds.
+    """
+    import numpy as np
+
+    sims = sorted({int(s) for s in sims})
+    by_block: dict[int, list[int]] = {}
+    for sim in sims:
+        by_block.setdefault(block_of(sim), []).append(sim)
+    for block in by_block:
+        by_block[block] = sorted(by_block[block])
+    full = sorted(b for b, v in by_block.items() if len(v) == FULL_BLOCK_SIZE)
+    small = sorted(b for b, v in by_block.items() if len(v) != FULL_BLOCK_SIZE)
+    if len(full) != 30 or len(small) != 30 or len(sims) != 228:
+        raise ValueError(
+            f"expected 30 full + 30 partial blocks and 228 cones, got "
+            f"{len(full)} + {len(small)} and {len(sims)}"
+        )
+    rng_full = np.random.default_rng(seed)
+    rng_small = np.random.default_rng(seed)
+    full_order = [full[i] for i in rng_full.permutation(len(full))]
+    small_order = [small[i] for i in rng_small.permutation(len(small))]
+
+    def interleave(a, b):
+        return [x for pair in zip(a, b) for x in pair]
+
+    train_blocks = interleave(full_order[:22], small_order[:22])
+    val_blocks = interleave(full_order[22:26], small_order[22:26])
+    test_blocks = interleave(full_order[26:], small_order[26:])
+
+    def entry(blocks):
+        return {
+            "n_blocks": len(blocks),
+            "n_cones": int(sum(len(by_block[b]) for b in blocks)),
+            "blocks": {str(b): by_block[b] for b in blocks},
+            "sims": sorted(s for b in blocks for s in by_block[b]),
+        }
+
+    payload = {
+        "schema": V2_SCHEMA,
+        "seed": int(seed),
+        "rule": "block = (sim_id - 10000) // 6",
+        "block_rule_note": "30 complete 6-cone groups plus 30 partial groups; all 228 cones assigned",
+        "offset": BLOCK_OFFSET,
+        "block_size": BLOCK_SIZE,
+        "n_cones": len(sims),
+        "n_blocks": len(by_block),
+        "n_blocks_used": len(train_blocks) + len(val_blocks) + len(test_blocks),
+        "block_sizes": {
+            str(size): sum(1 for value in by_block.values() if len(value) == size)
+            for size in sorted({len(value) for value in by_block.values()})
+        },
+        "split_sizes": [len(train_blocks), len(val_blocks), len(test_blocks)],
+        "train_blocks": list(train_blocks),
+        "val_blocks": list(val_blocks),
+        "test_blocks": list(test_blocks),
+        "splits": {
+            "train": entry(train_blocks),
+            "val": entry(val_blocks),
+            "test": entry(test_blocks),
+        },
+        "stage_slices": stage_slices,
+    }
+    return payload
 
 
 def load_split(path: str | Path) -> dict:
     """Load and normalise a block-split JSON file."""
     path = Path(path)
     raw = json.loads(path.read_text())
+    rule = str(raw.get("rule", ""))
+    offset = int(raw.get("offset", 10001 if "10001" in rule else BLOCK_OFFSET))
+    block_size = int(raw.get("block_size", BLOCK_SIZE))
     block_to_split: dict[int, str] = {}
     block_to_sims: dict[int, list[int]] = {}
     split_blocks: dict[str, list[int]] = {}
@@ -112,7 +201,7 @@ def load_split(path: str | Path) -> dict:
         block = int(key)
         if isinstance(value, dict):
             split = value.get("split")
-            sims = value.get("sims", sims_of_block(block))
+            sims = value.get("sims", sims_of_block(block, offset))
         else:
             split = None
             sims = value
@@ -145,9 +234,9 @@ def load_split(path: str | Path) -> dict:
             if block in block_to_split and block_to_split[block] != name:
                 raise ValueError(f"{path}: block {block} appears in both {block_to_split[block]} and {name}")
             block_to_split[block] = name
-            block_to_sims.setdefault(block, sims_of_block(block))
+            block_to_sims.setdefault(block, sims_of_block(block, offset))
     for block in block_to_split:
-        block_to_sims.setdefault(block, sims_of_block(block))
+        block_to_sims.setdefault(block, sims_of_block(block, offset))
 
     assigned = set(block_to_split)
     duplicates = [
@@ -160,8 +249,8 @@ def load_split(path: str | Path) -> dict:
         "path": str(path),
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "seed": int(raw.get("seed", 0)),
-        "block_size": int(raw.get("block_size", BLOCK_SIZE)),
-        "offset": int(raw.get("offset", BLOCK_OFFSET)),
+        "block_size": block_size,
+        "offset": offset,
         "train_blocks": split_blocks.get("train", []),
         "val_blocks": split_blocks.get("val", []),
         "test_blocks": split_blocks.get("test", []),
@@ -184,21 +273,17 @@ def load_split(path: str | Path) -> dict:
 
 
 def nested_train_blocks(split: dict, n: int | None) -> list[int]:
-    """A deterministic nested prefix of a seed-based shuffle of the train blocks.
+    """A nested prefix of the train-block order stored in the split file.
 
-    The external file's block mapping is sorted by block id, so taking its first
-    ``n`` blocks would confound the learning-curve arms with parameter-grid
-    position.  We instead shuffle the train block ids with the split's seed;
-    the 4/8/16/28 subsets are prefixes of one permutation and therefore nested.
-    ``n <= 0`` or ``n >= len(train_blocks)`` means all training blocks.
+    The v2 generator stores the 44 train blocks in a deterministic full/small
+    interleave; the prefixes 4, 8, 16, 32 and 44 therefore each contain both
+    complete and partial parameter groups.  ``n <= 0`` or ``n >= 44`` means all
+    training blocks.
     """
     blocks = list(split["train_blocks"])
-    if n is None or int(n) <= 0:
-        n = len(blocks)
-    import numpy as np
-
-    order = np.random.default_rng(int(split.get("seed", 0))).permutation(len(blocks))
-    return [blocks[int(i)] for i in order[: min(int(n), len(blocks))]]
+    if n is None or int(n) <= 0 or int(n) >= len(blocks):
+        return blocks
+    return blocks[: int(n)]
 
 
 def blocks_for_split(split: dict, name: str) -> list[int]:

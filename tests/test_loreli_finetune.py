@@ -20,6 +20,7 @@ from ebm21cm.data.loreli_splits import (
     filter_sims_by_split,
     load_split,
     make_split,
+    make_v2_split,
     nested_train_blocks,
 )
 from ebm21cm.evaluate_loreli import fingerprint
@@ -64,7 +65,7 @@ def test_select_target_indices_keeps_all_active_and_two_background_slices():
 
 
 def test_block_split_is_nested_deterministic_and_loadable(tmp_path):
-    sims = [10001 + i for i in range(228)]
+    sims = [10000 + i for i in range(228)]
     split = make_split(sims, seed=0)
     assert len(split["train_blocks"]) == 28
     assert len(split["val_blocks"]) == 5
@@ -75,12 +76,52 @@ def test_block_split_is_nested_deterministic_and_loadable(tmp_path):
     path.write_text(json.dumps(split))
     loaded = load_split(path)
     assert loaded["train_blocks"] == split["train_blocks"]
-    assert loaded["train_sims"] == sorted(s for b in split["train_blocks"] for s in range(10001 + 6 * b, 10007 + 6 * b))
+    assert loaded["train_sims"] == sorted(s for b in split["train_blocks"] for s in split["blocks"][str(b)]["sims"])
     four = nested_train_blocks(loaded, 4)
     eight = nested_train_blocks(loaded, 8)
     assert len(four) == 4 and four == eight[:4]
     assert len(nested_train_blocks(loaded, 28)) == 28
     assert filter_sims_by_split(loaded["train_sims"] + loaded["test_sims"], loaded, "test") == loaded["test_sims"]
+
+
+def test_v2_split_stratifies_60_blocks_and_interleaves():
+    partial_sizes = [1] * 23 + [2] * 2 + [3] + [4] * 2 + [5] * 2
+    sims = []
+    for block in range(30):
+        sims += list(range(10000 + 6 * block, 10006 + 6 * block))
+    for index, size in enumerate(partial_sizes, start=30):
+        sims += list(range(10000 + 6 * index, 10000 + 6 * index + size))
+    assert len(sims) == 228
+
+    payload = make_v2_split(sims, seed=0)
+    assert payload["n_blocks"] == 60
+    assert payload["split_sizes"] == [44, 8, 8]
+    path = Path(tempfile.mkdtemp()) / "v2.json"
+    path.write_text(json.dumps(payload))
+    loaded = load_split(path)
+    assert (len(loaded["train_blocks"]), len(loaded["val_blocks"]), len(loaded["test_blocks"])) == (44, 8, 8)
+    assert len(loaded["train_sims"]) + len(loaded["val_sims"]) + len(loaded["test_sims"]) == 228
+    assert len(loaded["sim_to_split"]) == 228
+
+    for name, expected in (("train", 44), ("val", 8), ("test", 8)):
+        blocks = loaded[f"{name}_blocks"]
+        assert len(blocks) == expected
+        sizes = [len(loaded["block_to_sims"][b]) for b in blocks]
+        assert sum(size == 6 for size in sizes) == expected // 2
+        assert sum(size != 6 for size in sizes) == expected // 2
+
+    previous = []
+    for n in (4, 8, 16, 32, 44):
+        prefix = nested_train_blocks(loaded, n)
+        assert prefix[: len(previous)] == previous
+        sizes = [len(loaded["block_to_sims"][b]) for b in prefix]
+        assert any(size == 6 for size in sizes) and any(size != 6 for size in sizes)
+        previous = prefix
+
+    # A block cannot appear in two splits, nor can its cones.
+    for block in loaded["block_to_sims"]:
+        owners = [name for name in ("train", "val", "test") if block in loaded[f"{name}_blocks"]]
+        assert len(owners) == 1
 
 
 def test_block_split_accepts_shorthand_lists(tmp_path):
@@ -90,7 +131,7 @@ def test_block_split_accepts_shorthand_lists(tmp_path):
     loaded = load_split(path)
     assert loaded["train_blocks"] == blocks[:28]
     assert loaded["test_blocks"] == blocks[33:]
-    assert loaded["test_sims"][0] == 10001 + 6 * blocks[33]
+    assert loaded["test_sims"][0] == 10000 + 6 * blocks[33]
 
 
 def test_block_split_accepts_binac_splits_schema(tmp_path):
@@ -301,11 +342,11 @@ def test_cache_build_writes_the_documented_schema(tmp_path, monkeypatch):
     """Exercise the HDF5 writer without a real 480 MB cone."""
     import ebm21cm.data.loreli_cache as cache_mod
 
-    split = make_split([10001 + i for i in range(228)], seed=0)
+    split = make_split([10000 + i for i in range(228)], seed=0)
     split_path = tmp_path / "split.json"
     split_path.write_text(json.dumps(split))
     block = split["train_blocks"][0]
-    sim = 10001 + 6 * block
+    sim = 10000 + 6 * block
 
     training = tmp_path / "training.h5"
     with h5py.File(training, "w") as h:
@@ -403,7 +444,7 @@ def test_trainer_smoke_builds_a_loreli_checkpoint(tmp_path):
         "head": "structured", "tb_norm": (0.0, 1.0), "step": 1,
     }, reference / "best.pt")
 
-    split = make_split([10001 + i for i in range(228)], seed=0)
+    split = make_split([10000 + i for i in range(228)], seed=0)
     split_path = tmp_path / "split.json"
     split_path.write_text(json.dumps(split))
     split_info = load_split(split_path)

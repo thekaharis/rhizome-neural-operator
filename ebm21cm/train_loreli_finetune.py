@@ -34,7 +34,7 @@ import torch.nn.functional as F
 
 from .data.loreli_cache import SCHEMA
 from .data.loreli_memory import LoReLiMemorySplit, LoReLiStream
-from .data.loreli_splits import load_split, nested_train_blocks
+from .data.loreli_splits import DEFAULT_SPLIT_FILE, load_split, nested_train_blocks
 from .model.freeze import (
     FREEZE_CHOICES,
     freeze_model,
@@ -246,6 +246,11 @@ def run(
             "the cache was built from a different block-split file; rebuild it or use the matching split"
         )
     train_blocks = nested_train_blocks(split, config.train_blocks)
+    if config.train_blocks and config.train_blocks > len(split["train_blocks"]):
+        raise ValueError(
+            f"--train-blocks {config.train_blocks} exceeds the {len(split['train_blocks'])} "
+            "training blocks in the split"
+        )
     if not train_blocks:
         raise ValueError("no training blocks selected")
     model, model_config, best = build_finetune_model(init_from, scratch=scratch)
@@ -411,7 +416,7 @@ def main(argv=None):
     p.add_argument("--run-dir", required=True)
     p.add_argument("--init-from", required=True,
                    help="reference run directory (best.pt); also supplies the config for --scratch")
-    p.add_argument("--split-file", default="runs/loreli_splits/block_split_seed0.json")
+    p.add_argument("--split-file", default=DEFAULT_SPLIT_FILE)
     p.add_argument("--freeze", choices=FREEZE_CHOICES, default="decoder")
     p.add_argument("--scratch", action="store_true")
     p.add_argument("--device", default="cuda")

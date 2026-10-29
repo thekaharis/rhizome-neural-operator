@@ -43,7 +43,7 @@ import torch
 
 from . import loreli_metrics as lm
 from .data.loreli import LoreliAdapter, LoreliCone, loreli_files, read_cube, training_stats
-from .data.loreli_splits import load_split
+from .data.loreli_splits import DEFAULT_SPLIT_FILE, load_split
 from .loreli_inference import border_mask, downsample_transverse, load_model, map_to_native, predict_cone, predict_targets
 
 SIGMAS = (0.0, 2.3, 4.7)
@@ -307,7 +307,7 @@ def main(argv=None):
     ap.add_argument("--ids", type=int, nargs="*", default=None, help="simulation numbers (default: all)")
     ap.add_argument("--ids-from-split", choices=("train", "val", "test"), default=None,
                     help="restrict to the simulation ids of this block split")
-    ap.add_argument("--split-file", default="runs/loreli_splits/block_split_seed0.json",
+    ap.add_argument("--split-file", default=DEFAULT_SPLIT_FILE,
                     help="block-split JSON used by --ids-from-split")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--l-perp", type=float, default=294.0, choices=(294.0, 300.0))
