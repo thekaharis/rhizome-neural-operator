@@ -37,14 +37,47 @@ def smooth(field, sigma_mpc, cell):
     return field if sigma_mpc <= 0 else gaussian_filter(field, sigma_mpc / cell, mode="nearest")
 
 
-def iou_matched(pred, true, threshold=0.5):
-    """IoU of the ionized masks with the prediction thresholded at the truth's ionized fraction."""
+def ionized_mask_matched(pred, true, threshold=0.5):
+    """Ionized mask selecting exactly as many cells as the truth's ionized mask.
+
+    The prediction is ranked by x_HI: the ``n = count(true < threshold)``
+    lowest cells are labelled ionized.  A rank cut keeps the count exact even
+    when the prediction has ties or float16 plateaus, which a quantile cut
+    does not.  Ties are broken by flattened cell index (stable sort), so the
+    mask is deterministic.
+
+    This is the orientation that matters: ionized means *low* x_HI, so the
+    lowest ``f`` fraction is selected, not the lowest ``1 - f``.
+    """
+    pred = np.asarray(pred, dtype=np.float64)
+    true = np.asarray(true)
+    if pred.shape != true.shape:
+        raise ValueError(f"pred and true must have the same shape, got {pred.shape} and {true.shape}")
     ion = true < threshold
+    n = int(np.count_nonzero(ion))
+    if n == 0 or n == pred.size:
+        return np.zeros(pred.shape, dtype=bool) if n == 0 else np.ones(pred.shape, dtype=bool)
+    if not np.all(np.isfinite(pred)):
+        raise ValueError("pred contains non-finite values")
+    order = np.argsort(pred.ravel(), kind="stable")
+    guess = np.zeros(pred.size, dtype=bool)
+    guess[order[:n]] = True
+    return guess.reshape(pred.shape)
+
+
+def iou_matched(pred, true, threshold=0.5):
+    """IoU of the ionized masks with the prediction cut at the truth's ionized fraction.
+
+    The prediction is thresholded by rank (see :func:`ionized_mask_matched`)
+    so that both masks contain exactly the same number of cells.  A quantile
+    cut at ``1 - fraction`` would select the ionized complement and cap IoU
+    at ``min(f, 1-f) / max(f, 1-f)`` for continuous predictions.
+    """
+    ion = np.asarray(true) < threshold
     fraction = float(ion.mean())
     if not 0 < fraction < 1:
         return float("nan")
-    cut = np.quantile(pred, 1.0 - fraction)
-    guess = pred <= cut
+    guess = ionized_mask_matched(pred, true, threshold)
     union = np.count_nonzero(ion | guess)
     return float(np.count_nonzero(ion & guess) / union) if union else float("nan")
 

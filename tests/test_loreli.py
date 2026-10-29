@@ -338,3 +338,63 @@ def test_metrics_on_a_synthetic_front():
     assert 0 < lm.iou_matched(noisy, true) < 1
     profile = lm.front_profile(true, true, 1.0, lm.FRONT_EDGES)
     assert profile is not None and profile[0].sum() > 0
+
+
+def _ramp_with_fraction(fraction, size=64):
+    """A continuous x_HI field whose true ionized fraction is exactly ``fraction``."""
+    total = size * size
+    n = int(round(fraction * total))
+    values = np.concatenate([np.linspace(0.0, 0.49, n, endpoint=False),
+                             np.linspace(0.51, 1.0, total - n)])
+    return values.reshape(size, size)
+
+
+def test_iou_matched_continuous_identity_at_all_fractions():
+    """An exact prediction gives IoU 1, including the f=0.2/0.8 cases the old cut capped at 0.25."""
+    for fraction in (0.2, 0.5, 0.8):
+        true = _ramp_with_fraction(fraction)
+        assert lm.iou_matched(true.copy(), true) == pytest.approx(1.0, abs=1e-12)
+
+
+def test_iou_matched_monotone_transform_identity():
+    true = _ramp_with_fraction(0.3)
+    for transform in (lambda value: value ** 3, lambda value: np.exp(value)):
+        assert lm.iou_matched(transform(true), true) == pytest.approx(1.0, abs=1e-12)
+
+
+def test_iou_matched_selects_exact_count_with_ties():
+    true = _ramp_with_fraction(0.25, size=32)
+    n = int(np.count_nonzero(true < 0.5))
+    pred = np.zeros_like(true)  # every cell tied
+    guess = lm.ionized_mask_matched(pred, true)
+    assert int(guess.sum()) == n
+    # Deterministic tie-break: the first n cells in flattened order.
+    expected = np.zeros(true.size, dtype=bool)
+    expected[:n] = True
+    assert np.array_equal(guess.ravel(), expected)
+    assert np.array_equal(guess, lm.ionized_mask_matched(pred, true))
+
+
+def test_iou_matched_binary_matched_baseline_unchanged():
+    """A binary baseline with the truth's ionized count scores the same as the fixed-threshold IoU."""
+    truth = _ramp_with_fraction(0.35, size=32)
+    n = int(np.count_nonzero(truth < 0.5))
+    rng = np.random.default_rng(7)
+    pred = np.ones(truth.size)
+    pred[rng.permutation(truth.size)[:n]] = 0.0
+    pred = pred.reshape(truth.shape)
+    ion = truth < 0.5
+    guess = pred < 0.5
+    expected = np.count_nonzero(ion & guess) / np.count_nonzero(ion | guess)
+    assert lm.iou_matched(pred, truth) == pytest.approx(expected, abs=1e-12)
+
+
+def test_iou_matched_orientation_regression():
+    true = _ramp_with_fraction(0.2)
+    assert lm.iou_matched(1.0 - true, true) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_iou_matched_float16_plateaus():
+    true = _ramp_with_fraction(0.4)
+    pred = true.astype(np.float16).astype(np.float64)
+    assert lm.iou_matched(pred, true) == pytest.approx(1.0, abs=1e-12)
