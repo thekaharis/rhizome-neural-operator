@@ -282,17 +282,15 @@ def build(
 
     files, file_sims = loreli_files(data)
     keep = []
-    unassigned = []
     for path, sim in zip(files, file_sims):
         if sims is not None and int(sim) not in set(int(s) for s in sims):
             continue
-        if int(sim) not in split["sim_to_split"]:
-            unassigned.append(int(sim))
         keep.append((path, int(sim)))
     if limit:
         keep = keep[: int(limit)]
     if not keep:
         raise SystemExit("no cones selected")
+    unassigned = [sim for _, sim in keep if sim not in split["sim_to_split"]]
     log(f"building {out}: {len(keep)} cones ({len(unassigned)} unassigned, stored split=-1), "
         f"{split['train_blocks'].__len__()} train / {split['val_blocks'].__len__()} val / "
         f"{split['test_blocks'].__len__()} test blocks; l_perp={l_perp}, domain={domain}, device={device}")

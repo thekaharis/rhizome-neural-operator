@@ -181,16 +181,18 @@ def evaluate(model, loader, device, tb_norm, tb_weight, head="structured"):
     }
 
 
-def _signature(cache, init_from, config, freeze, train_blocks, split, source_root):
+def _signature(cache, init_from, config, freeze, train_blocks, split, source_root, *, scratch, device):
     return {
         "cache_sha256": _sha256(cache),
         "init_from": str(Path(init_from).resolve()),
         "checkpoint_sha256": _sha256(Path(init_from) / "best.pt"),
         "freeze": freeze,
+        "scratch": bool(scratch),
+        "device": str(device),
+        "storage": config.storage,
         "train_blocks": list(train_blocks),
         "split_sha256": split["sha256"],
         "config": {k: v for k, v in asdict(config).items() if k != "max_steps"},
-        "device": config.storage,
         "torch": str(torch.__version__),
         "source_sha256": {
             path: _sha256(source_root / path)
@@ -283,7 +285,8 @@ def run(
         raise ValueError("empty train or validation split")
 
     root = Path(__file__).resolve().parents[1]
-    signature = _signature(cache, init_from, config, freeze, train_blocks, split, root)
+    signature = _signature(cache, init_from, config, freeze, train_blocks, split, root,
+                           scratch=scratch, device=device)
     stream = LoReLiStream(train, config.batch_size, config.seed)
     val_loader = val.loader(config.eval_batch_size)
 

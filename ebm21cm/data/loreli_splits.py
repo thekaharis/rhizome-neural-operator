@@ -184,15 +184,21 @@ def load_split(path: str | Path) -> dict:
 
 
 def nested_train_blocks(split: dict, n: int | None) -> list[int]:
-    """The first ``n`` train blocks in file order; ``n <= 0`` or ``n >= 28`` means all.
+    """A deterministic nested prefix of a seed-based shuffle of the train blocks.
 
-    File order is the seed-0 permutation, so the subsets are nested:
-    4 ⊂ 8 ⊂ 16 ⊂ 28.
+    The external file's block mapping is sorted by block id, so taking its first
+    ``n`` blocks would confound the learning-curve arms with parameter-grid
+    position.  We instead shuffle the train block ids with the split's seed;
+    the 4/8/16/28 subsets are prefixes of one permutation and therefore nested.
+    ``n <= 0`` or ``n >= len(train_blocks)`` means all training blocks.
     """
     blocks = list(split["train_blocks"])
-    if n is None or int(n) <= 0 or int(n) >= len(blocks):
-        return blocks
-    return blocks[: int(n)]
+    if n is None or int(n) <= 0:
+        n = len(blocks)
+    import numpy as np
+
+    order = np.random.default_rng(int(split.get("seed", 0))).permutation(len(blocks))
+    return [blocks[int(i)] for i in order[: min(int(n), len(blocks))]]
 
 
 def blocks_for_split(split: dict, name: str) -> list[int]:

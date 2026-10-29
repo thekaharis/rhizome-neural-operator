@@ -22,6 +22,7 @@ from ebm21cm.data.loreli_splits import (
     make_split,
     nested_train_blocks,
 )
+from ebm21cm.evaluate_loreli import fingerprint
 from ebm21cm.loreli_inference import load_model
 from ebm21cm.model.freeze import (
     category_of,
@@ -32,7 +33,7 @@ from ebm21cm.model.freeze import (
 from ebm21cm.model.remap import remapped_model
 from ebm21cm.model.rhizome import build_model
 from ebm21cm.train_loreli_finetune import _batch_loss
-from tests.test_loreli import REAL_STATS, write_cone
+from tests.test_loreli import REAL_STATS, _fingerprint_args, write_cone
 
 
 def _tiny_model(modes=4, n_steps=1):
@@ -110,8 +111,48 @@ def test_block_split_accepts_binac_splits_schema(tmp_path):
     assert loaded["val_blocks"] == [511, 571]
     assert loaded["test_blocks"] == [614]
     assert loaded["train_sims"] == [12352, 12353, 12354, 12677, 12713, 12714, 13036]
-    assert nested_train_blocks(loaded, 2) == [391, 392]
+    two = nested_train_blocks(loaded, 2)
+    six = nested_train_blocks(loaded, 6)
+    assert len(two) == 2 and two == six[:2]
+    assert set(two) <= set(loaded["train_blocks"])
     assert filter_sims_by_split([12352, 13036, 13685], loaded, "test") == [13685]
+
+
+def test_ids_from_split_filters_and_fingerprint(tmp_path):
+    args = _fingerprint_args(tmp_path)
+    old = fingerprint(args, {"step": 1})
+    assert "ids_from_split" not in old and "split_sha256" not in old
+
+    test_blocks = {
+        "100": [10001, 10002, 10003],
+        "101": [10004, 10005],
+        "102": [10006, 10007],
+        "103": [10008, 10009],
+        "104": [10010, 10011],
+    }
+    split = {
+        "seed": 0, "splits": {
+            "train": {"blocks": {"1": [10012], "2": [10013]}, "sims": [10012, 10013]},
+            "val": {"blocks": {"3": [10014]}, "sims": [10014]},
+            "test": {"blocks": test_blocks, "sims": [s for v in test_blocks.values() for s in v]},
+        },
+    }
+    path = tmp_path / "split.json"
+    path.write_text(json.dumps(split))
+    loaded = load_split(path)
+    assert filter_sims_by_split(range(10001, 10015), loaded, "test") == loaded["test_sims"]
+    assert len(loaded["test_sims"]) == 11
+
+    args.ids_from_split = "test"
+    args.split_file = path
+    new = fingerprint(args, {"step": 1})
+    assert new["ids_from_split"] == "test"
+    assert new["split_sha256"] == loaded["sha256"]
+    assert new["split_file"] == str(path.resolve())
+    # No split flags: the old fingerprint is byte-identical for the same run.
+    del args.ids_from_split
+    del args.split_file
+    assert fingerprint(args, {"step": 1}) == old
 
 
 def test_cache_rows_equal_evaluation_inputs():
@@ -128,8 +169,9 @@ def test_cache_rows_equal_evaluation_inputs():
         inp = adapter.inputs(index, index + 1)
         assert arrays["cond"].shape == (1, 26, 280, 280)
         assert arrays["scalars"].shape == (1, 38)
-        assert np.allclose(arrays["cond"][0].astype(np.float32), np.asarray(inp["cond"])[0], atol=2e-2, rtol=1e-2)
-        assert np.allclose(arrays["phys"][0].astype(np.float32), np.asarray(inp["phys"])[0, 0], atol=2e-2, rtol=1e-2)
+        assert np.allclose(arrays["cond"][0].astype(np.float32), np.asarray(inp["cond"])[0],
+                           atol=5e-3, rtol=1e-3)
+        assert np.array_equal(arrays["phys"][0], np.asarray(inp["phys"])[0, 0])
         assert np.allclose(arrays["scalars"][0], inp["scalars"][0], atol=1e-6)
         assert int(arrays["los_index"][0]) == index
         mask = padding_mask(280, adapter.n_out).astype(bool)
@@ -400,6 +442,55 @@ def test_trainer_smoke_builds_a_loreli_checkpoint(tmp_path):
     assert best["model_config"]["modes"] == 8
     native, remapped, _ = load_model(run_dir)
     assert native is remapped and native.modes == 8
+
+    # Resume must continue the same run; scratch/device changes must refuse.
+    resumed = train_run(
+        cache, run_dir, reference, freeze="decoder", split_file=split_path,
+        config=FinetuneConfig(
+            max_steps=3, min_steps=1, batch_size=2, eval_batch_size=2,
+            lr_new=1e-3, lr_pretrained=1e-3, min_lr=1e-5, val_every=1,
+            seed=0, threads=1, storage="cpu",
+        ),
+        device="cpu", resume=True, log=lambda *a: None,
+    )
+    assert resumed["steps"] == 3
+    with pytest.raises(ValueError, match="resume"):
+        train_run(
+            cache, run_dir, reference, freeze="none", scratch=True, split_file=split_path,
+            config=FinetuneConfig(
+                max_steps=3, min_steps=1, batch_size=2, eval_batch_size=2,
+                lr_new=1e-3, lr_pretrained=1e-3, min_lr=1e-5, val_every=1,
+                seed=0, threads=1, storage="cpu",
+            ),
+            device="cpu", resume=True, log=lambda *a: None,
+        )
+    with pytest.raises(ValueError, match="resume"):
+        train_run(
+            cache, run_dir, reference, freeze="decoder", split_file=split_path,
+            config=FinetuneConfig(
+                max_steps=3, min_steps=1, batch_size=2, eval_batch_size=2,
+                lr_new=1e-3, lr_pretrained=1e-3, min_lr=1e-5, val_every=1,
+                seed=0, threads=1, storage="cpu",
+            ),
+            device="cpu:0", resume=True, log=lambda *a: None,
+        )
+
+    # Scratch: same architecture, random init, every parameter trainable.
+    scratch_dir = tmp_path / "run_scratch"
+    scratch = train_run(
+        cache, scratch_dir, reference, freeze="none", scratch=True, split_file=split_path,
+        config=FinetuneConfig(
+            max_steps=1, min_steps=1, batch_size=2, eval_batch_size=2,
+            lr_new=1e-3, lr_pretrained=1e-3, min_lr=1e-5, val_every=1,
+            seed=0, threads=1, storage="cpu",
+        ),
+        device="cpu", log=lambda *a: None,
+    )
+    scratch_best = torch.load(scratch_dir / "best.pt", map_location="cpu", weights_only=False)
+    assert scratch["steps"] == 1 and scratch_best["scratch"] is True
+    assert scratch["trainable_parameters"] == sum(
+        p.numel() for p in load_model(reference)[1].parameters()
+    )
 
     # lr=0 with freeze=none must reproduce the zero-shot initialization exactly.
     zero_dir = tmp_path / "run_zero"
