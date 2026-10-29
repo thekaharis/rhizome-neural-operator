@@ -43,6 +43,7 @@ import torch
 
 from . import loreli_metrics as lm
 from .data.loreli import LoreliAdapter, LoreliCone, loreli_files, read_cube, training_stats
+from .data.loreli_splits import load_split
 from .loreli_inference import border_mask, downsample_transverse, load_model, map_to_native, predict_cone, predict_targets
 
 SIGMAS = (0.0, 2.3, 4.7)
@@ -216,20 +217,26 @@ def _code_commit():
 def fingerprint(args, best):
     """Complete config signature stored with each cone so a resume cannot mix runs."""
     commit, dirty = _code_commit()
-    return {"run": str(args.run.resolve()), "step": best.get("step"),
-            "checkpoint_sha256": _sha256(args.run / "best.pt"),
-            "data": str(args.data.resolve()), "cache": str(args.cache.resolve()),
-            "l_perp": args.l_perp, "border": args.border, "los_margin": args.los_margin,
-            "slice_stride": args.slice_stride, "min_per_stage": args.min_per_stage,
-            "shape_per_stage": args.shape_per_stage, "baseline_per_stage": args.baseline_per_stage,
-            "no_baselines": bool(args.no_baselines),
-            "density_mean": args.density_mean, "velocity": args.velocity,
-            "device": str(torch.device(args.device)),
-            "torch_inputs": bool(args.force_torch_inputs or torch.device(args.device).type != "cpu"),
-            "n_native": args.n_native, "n_los": args.n_los,
-            "z_range": list(args.z_range), "z_window": list(args.z_window) if args.z_window else None,
-            "ids": None if not args.ids else sorted(int(i) for i in args.ids), "limit": args.limit,
-            "code_commit": commit, "code_dirty": bool(dirty)}
+    fp = {"run": str(args.run.resolve()), "step": best.get("step"),
+          "checkpoint_sha256": _sha256(args.run / "best.pt"),
+          "data": str(args.data.resolve()), "cache": str(args.cache.resolve()),
+          "l_perp": args.l_perp, "border": args.border, "los_margin": args.los_margin,
+          "slice_stride": args.slice_stride, "min_per_stage": args.min_per_stage,
+          "shape_per_stage": args.shape_per_stage, "baseline_per_stage": args.baseline_per_stage,
+          "no_baselines": bool(args.no_baselines),
+          "density_mean": args.density_mean, "velocity": args.velocity,
+          "device": str(torch.device(args.device)),
+          "torch_inputs": bool(args.force_torch_inputs or torch.device(args.device).type != "cpu"),
+          "n_native": args.n_native, "n_los": args.n_los,
+          "z_range": list(args.z_range), "z_window": list(args.z_window) if args.z_window else None,
+          "ids": None if not args.ids else sorted(int(i) for i in args.ids), "limit": args.limit,
+          "code_commit": commit, "code_dirty": bool(dirty)}
+    ids_from_split = getattr(args, "ids_from_split", None)
+    if ids_from_split:
+        fp["ids_from_split"] = ids_from_split
+        fp["split_file"] = str(Path(args.split_file).resolve())
+        fp["split_sha256"] = _sha256(args.split_file)
+    return fp
 
 
 def load_completed(out, fp):
@@ -298,6 +305,10 @@ def main(argv=None):
     ap.add_argument("--cache", type=Path, required=True, help="training slice cache (bands + normalization)")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--ids", type=int, nargs="*", default=None, help="simulation numbers (default: all)")
+    ap.add_argument("--ids-from-split", choices=("train", "val", "test"), default=None,
+                    help="restrict to the simulation ids of this block split")
+    ap.add_argument("--split-file", default="runs/loreli_splits/block_split_seed0.json",
+                    help="block-split JSON used by --ids-from-split")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--l-perp", type=float, default=294.0, choices=(294.0, 300.0))
     ap.add_argument("--density-mean", choices=("slice", "cone"), default="slice")
@@ -335,11 +346,18 @@ def main(argv=None):
     device = torch.device(args.device)
     model = model.to(device)
     files, sims = loreli_files(args.data)
+    if args.ids_from_split:
+        split = load_split(args.split_file)
+        wanted = set(split[f"{args.ids_from_split}_sims"])
+        files = [p for p, s in zip(files, sims) if int(s) in wanted]
+        sims = [s for s in sims if int(s) in wanted]
     if args.ids:
         wanted = set(args.ids)
         files = [p for p, s in zip(files, sims) if s in wanted]
+        sims = [s for s in sims if s in wanted]
     if args.limit:
         files = files[:args.limit]
+        sims = sims[:args.limit]
     if not files:
         raise SystemExit("no cones selected")
     fp = fingerprint(args, best)

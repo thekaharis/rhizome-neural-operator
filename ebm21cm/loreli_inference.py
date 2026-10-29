@@ -41,6 +41,10 @@ def load_model(run, factor=2):
         raise SystemExit(f"{run}: scalar_dim {config.get('scalar_dim')} != {expected} (38 minus dropped history)")
     native = build_model(config).eval()
     native.load_state_dict(best["model"])
+    if int(best.get("domain_factor", 1)) > 1:
+        # A fine-tuned checkpoint is already stored on the LoReLi 280-cell
+        # domain.  Applying the 2x remap again would double the modes.
+        return native, native, best
     return native, remapped_model(config, best["model"], factor).eval(), best
 
 
