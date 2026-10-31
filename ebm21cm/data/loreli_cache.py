@@ -25,12 +25,16 @@ the histories are LoReLi's own.  ``parameter_mode`` records that choice.
 Build::
 
     python -m ebm21cm.data.loreli_cache build \
-        --out runs/loreli_cache/loreli_slices_l294.h5 \
+        --out runs/loreli_cache/loreli_slices_l294_v2.h5 \
         --data /pfs/.../data/loreli_lc128 \
         --training-cache /pfs/.../compressed/rhizome_mf_slices_all.h5 \
         --run /pfs/.../runs/rhizome_mf2d_w64_structured_all \
-        --split-file runs/loreli_splits/block_split_seed0.json \
-        --l-perp 294 --device cuda
+        --split-file runs/loreli_splits/block_split_v2_seed0.json \
+        --l-perp 294 --device cuda --assigned-only
+
+``--assigned-only`` stores only cones that the split file assigns to a split,
+so no row is written with ``split=-1``.  The v2 split assigns all 228 cones, so
+the flag is a no-op there; it exists for future partial splits.
 """
 
 from __future__ import annotations
@@ -254,11 +258,16 @@ def build(
     chunk: int = 8,
     limit: int | None = None,
     sims=None,
+    assigned_only: bool = False,
     parameter_mode: str = "training-mean",
     overwrite: bool = False,
     log=print,
 ) -> dict:
-    """Build the HDF5 cache.  Returns a small provenance dictionary."""
+    """Build the HDF5 cache.  Returns a small provenance dictionary.
+
+    ``assigned_only`` drops cones that the split file does not assign, so the
+    cache never contains ``split=-1`` rows.
+    """
     import torch
 
     if parameter_mode != "training-mean":
@@ -291,9 +300,20 @@ def build(
     if not keep:
         raise SystemExit("no cones selected")
     unassigned = [sim for _, sim in keep if sim not in split["sim_to_split"]]
-    log(f"building {out}: {len(keep)} cones ({len(unassigned)} unassigned, stored split=-1), "
-        f"{split['train_blocks'].__len__()} train / {split['val_blocks'].__len__()} val / "
-        f"{split['test_blocks'].__len__()} test blocks; l_perp={l_perp}, domain={domain}, device={device}")
+    stored_unassigned = list(unassigned)
+    selected = len(keep)
+    if assigned_only:
+        keep = [(path, sim) for path, sim in keep if sim in split["sim_to_split"]]
+        stored_unassigned = []
+        selection = (f"{len(keep)} of {selected} cones "
+                     f"({len(unassigned)} unassigned dropped by --assigned-only)")
+        if not keep:
+            raise SystemExit("no cones selected after --assigned-only; check --split-file")
+    else:
+        selection = f"{len(keep)} cones ({len(unassigned)} unassigned, stored split=-1)"
+    log(f"building {out}: {selection}, {len(split['train_blocks'])} train / "
+        f"{len(split['val_blocks'])} val / {len(split['test_blocks'])} test blocks; "
+        f"l_perp={l_perp}, domain={domain}, device={device}")
 
     n_out = int(round(float(l_perp) / TRAINING_CELL_MPC))
     mask = padding_mask(domain, n_out)
@@ -401,9 +421,10 @@ def build(
                 "parameter_mode": parameter_mode,
                 "split_file": str(Path(split_file).resolve()),
                 "split_sha256": split["sha256"],
+                "assigned_only": bool(assigned_only),
                 "n_cones": len(keep) - len(skipped),
-                "n_unassigned": len(unassigned),
-                "unassigned_sims": json.dumps(sorted(unassigned)),
+                "n_unassigned": len(stored_unassigned),
+                "unassigned_sims": json.dumps(sorted(stored_unassigned)),
                 "n_rows": int(n_rows),
                 "skipped": json.dumps(skipped),
                 "git_commit": git_commit(Path(__file__).resolve().parents[2]),
@@ -440,14 +461,16 @@ def main(argv=None):
     b.add_argument("--chunk", type=int, default=8)
     b.add_argument("--limit", type=int, default=None)
     b.add_argument("--sims", type=int, nargs="*", default=None)
+    b.add_argument("--assigned-only", action="store_true",
+                   help="store only cones assigned to a split (no split=-1 rows)")
     b.add_argument("--parameter-mode", default="training-mean")
     b.add_argument("--overwrite", action="store_true")
     a = ap.parse_args(argv)
     build(a.out, a.data, a.training_cache, a.run, a.split_file, l_perp=a.l_perp,
           domain=a.domain, active=_parse_pair(a.active), background=a.background,
           device=a.device, chunk=a.chunk, limit=a.limit, sims=a.sims,
-          parameter_mode=a.parameter_mode, overwrite=a.overwrite,
-          log=lambda s: print(s, flush=True))
+          assigned_only=a.assigned_only, parameter_mode=a.parameter_mode,
+          overwrite=a.overwrite, log=lambda s: print(s, flush=True))
     return 0
 
 

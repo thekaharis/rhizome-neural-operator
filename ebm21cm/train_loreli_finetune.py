@@ -7,10 +7,24 @@ checkpoint with the 24 -> 48 mode remap, or from random init for the scratch
 control.
 
     python -m ebm21cm.train_loreli_finetune \
-        --cache runs/loreli_cache/loreli_slices_l294.h5 \
+        --cache runs/loreli_cache/loreli_slices_l294_v2.h5 \
         --run-dir runs/loreli_finetune/l294_b8_decoder_seed0 \
         --init-from runs/rhizome_mf2d_w64_structured_all \
+        --split-file runs/loreli_splits/block_split_v2_seed0.json \
         --freeze decoder --train-blocks 8 --seed 0 --device cuda
+
+``--storage`` selects where the split's slices live.  ``cpu`` (default) loads
+them into host RAM; ``device`` keeps them on the GPU; ``disk`` reads each
+training batch from the HDF5 cache and keeps only the scalars and mask in RAM.
+The 44-block v2 arm (170 train + 28 val cones, ~272-310 GB of rows) needs
+``disk`` to fit the 240 GB host-RAM request.  In ``disk`` mode the smaller
+validation split (~38-50 GB) stays resident, so the ~60 validation passes do
+not re-read it.  Batch order is the same global permutation in every mode, and
+the returned tensors are identical, so the modes produce the same batches and
+losses for the same seed.
+
+``--train-blocks`` takes a nested prefix of the split's train-block order;
+``0`` (the default) means all of them (44 for the v2 split), not a literal zero.
 
 The loss is BCE on the continuous x_HI target plus the reference normalized
 T_b MSE, with both terms restricted to the valid 206x206 interior of the
@@ -65,7 +79,9 @@ class FinetuneConfig:
     seed: int = 0
     threads: int = 4
     tb_weight: float = 1.0
+    # Nested prefix of the split's train blocks; 0 = all of them (44 for v2).
     train_blocks: int = 0
+    # cpu = host RAM (default), device = GPU, disk = per-batch HDF5 reads.
     storage: str = "cpu"
 
     def validate(self) -> None:
@@ -86,8 +102,8 @@ class FinetuneConfig:
             raise ValueError("lr_factor must be in (0, 1)")
         if not 0 <= self.relative_min_delta < 1:
             raise ValueError("relative_min_delta must be in [0, 1)")
-        if self.storage not in ("cpu", "device"):
-            raise ValueError("storage must be 'cpu' or 'device'")
+        if self.storage not in ("cpu", "device", "disk"):
+            raise ValueError("storage must be 'cpu', 'device' or 'disk'")
 
 
 def load_reference(run: str | Path) -> tuple[torch.nn.Module, dict, dict]:
@@ -276,16 +292,25 @@ def run(
     for name in ("decoder", "ends", "pointwise", "spectral"):
         log(f"  {name:9s} {report['trainable_counts'][name]:>12,} / {report['counts'][name]:>12,}")
 
-    storage = device if config.storage == "device" else torch.device("cpu")
+    if config.storage == "disk":
+        train_storage, val_storage = "disk", torch.device("cpu")
+    elif config.storage == "device":
+        train_storage = val_storage = device
+    else:
+        train_storage = val_storage = torch.device("cpu")
     t0 = time.perf_counter()
-    train = LoReLiMemorySplit(cache, "train", blocks=train_blocks, storage=storage, device=device)
-    val = LoReLiMemorySplit(cache, "val", blocks=split["val_blocks"], storage=storage, device=device)
+    train = LoReLiMemorySplit(cache, "train", blocks=train_blocks, storage=train_storage, device=device)
+    val = LoReLiMemorySplit(cache, "val", blocks=split["val_blocks"], storage=val_storage, device=device)
     if scalar_keep is not None:
         keep = torch.as_tensor(scalar_keep, dtype=torch.long)
         train.scalars = train.scalars[:, keep]
         val.scalars = val.scalars[:, keep]
-    log(f"loaded {len(train)} train / {len(val)} val rows ({train.nbytes / 2**30:.1f} GiB) "
+    log(f"loaded {len(train)} train / {len(val)} val rows "
+        f"({(train.nbytes + val.nbytes) / 2**30:.1f} GiB resident, storage={config.storage}) "
         f"in {time.perf_counter() - t0:.0f} s")
+    if config.storage == "disk":
+        log(f"disk-backed train rows: {train.dataset_nbytes / 2**30:.1f} GiB read per epoch; "
+            f"val {val.dataset_nbytes / 2**30:.1f} GiB resident in RAM")
     if not len(train) or not len(val):
         raise ValueError("empty train or validation split")
 
@@ -404,6 +429,15 @@ def run(
         "best_step": plateau.best_step, "best_validation_score": plateau.best,
         "elapsed_training_seconds": seconds, "freeze": freeze, "scratch": bool(scratch),
         "train_blocks": train_blocks, "trainable_parameters": trainable,
+        "storage": config.storage,
+        "train_rows": len(train), "val_rows": len(val),
+        "resident_bytes": train.nbytes + val.nbytes,
+        "dataset_bytes": train.dataset_nbytes + val.dataset_nbytes,
+        "disk_reads": train.io_stats["reads"] + val.io_stats["reads"],
+        "disk_bytes_read": train.io_stats["bytes_read"] + val.io_stats["bytes_read"],
+        "train_disk_reads": train.io_stats["reads"],
+        "val_disk_reads": val.io_stats["reads"],
+        "seconds_per_step": seconds / step if step else None,
     }
     (run_dir / "results.json").write_text(json.dumps(result, indent=2))
     log(json.dumps(result, indent=2))
@@ -422,8 +456,13 @@ def main(argv=None):
     p.add_argument("--device", default="cuda")
     p.add_argument("--resume", action="store_true")
     for field in fields(FinetuneConfig):
+        help_text = None
+        if field.name == "train_blocks":
+            help_text = "nested prefix of the split's train blocks; 0 = all of them (44 for v2)"
+        elif field.name == "storage":
+            help_text = "cpu (host RAM, default), device (GPU), or disk (per-batch HDF5 reads)"
         p.add_argument("--" + field.name.replace("_", "-"), type=type(field.default),
-                       default=field.default)
+                       default=field.default, help=help_text)
     args = p.parse_args(argv)
     config = FinetuneConfig(**{f.name: getattr(args, f.name) for f in fields(FinetuneConfig)})
     run(args.cache, args.run_dir, args.init_from, freeze=args.freeze, scratch=args.scratch,

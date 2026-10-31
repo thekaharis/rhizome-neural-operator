@@ -15,7 +15,7 @@ from ebm21cm.data.loreli_cache import (
     rows_from_cone,
     select_target_indices,
 )
-from ebm21cm.data.loreli_memory import LoReLiMemorySplit
+from ebm21cm.data.loreli_memory import LoReLiMemorySplit, LoReLiStream
 from ebm21cm.data.loreli_splits import (
     filter_sims_by_split,
     load_split,
@@ -42,6 +42,72 @@ def _tiny_model(modes=4, n_steps=1):
         "in_channels": 26, "out_channels": 2, "scalar_dim": 38,
         "width": 8, "modes": modes, "n_steps": n_steps, "step_size": 0.5,
     })
+
+
+def _write_memory_cache(path, n=24, domain=32, n_out=20, seed=0, split_id=0, block=0):
+    rng = np.random.default_rng(seed)
+    with h5py.File(path, "w") as h:
+        h.create_dataset("cond", data=rng.standard_normal((n, 26, domain, domain)).astype(np.float16))
+        h.create_dataset("target", data=rng.random((n, 2, domain, domain)).astype(np.float16))
+        h.create_dataset("phys", data=(rng.random((n, domain, domain)) + 1.0).astype(np.float32))
+        h.create_dataset("scalars", data=rng.standard_normal((n, 38)).astype(np.float32))
+        h.create_dataset("mask", data=padding_mask(domain, n_out))
+        h.create_dataset("z", data=np.linspace(5, 15, n))
+        h.create_dataset("cone_id", data=np.repeat(np.arange(n // 2) + 10001, 2).astype(np.int64))
+        h.create_dataset("block", data=np.full(n, block, np.int32))
+        h.create_dataset("split", data=np.full(n, split_id, np.int8))
+        h.attrs.update({"schema": SCHEMA, "domain": domain, "n_out": n_out})
+
+
+def test_disk_storage_matches_cpu_batches_loss_and_augmentation(tmp_path):
+    path = tmp_path / "cache.h5"
+    _write_memory_cache(path, n=24)
+    cpu = LoReLiMemorySplit(path, "train", blocks=[0], storage="cpu")
+    disk = LoReLiMemorySplit(path, "train", blocks=[0], storage="disk")
+    assert np.array_equal(cpu.rows, disk.rows)
+    assert disk.cond is None and disk.target is None and disk.phys is None
+    assert disk.nbytes < cpu.nbytes
+    assert disk.dataset_nbytes == cpu.dataset_nbytes == len(cpu) * cpu.row_bytes
+
+    # Same seed, same exact global permutation, across the epoch boundary at 24 rows.
+    train_cpu, train_disk = LoReLiStream(cpu, 4, 0), LoReLiStream(disk, 4, 0)
+    model = _tiny_model().eval()
+    for step in range(8):
+        a, b = train_cpu.next(), train_disk.next()
+        for key in ("cond", "target", "phys", "mask", "scalars", "cone_id", "z"):
+            assert torch.equal(a[key], b[key]), f"{key} differs at step {step}"
+        loss_cpu, *_ = _batch_loss(model, a, (0.0, 1.0), 1.0)
+        loss_disk, *_ = _batch_loss(model, b, (0.0, 1.0), 1.0)
+        assert torch.equal(loss_cpu, loss_disk), f"loss differs at step {step}"
+    assert train_disk.position == train_cpu.position == 8
+    assert disk.io_stats["reads"] > 0 and disk.io_stats["bytes_read"] > 0
+
+    # Explicit dihedral codes: all eight elements, mixing 90-degree rotations and flips.
+    for codes in ([0, 1, 2, 3], [4, 5, 6, 7], [7, 0, 3, 5]):
+        a, b = cpu.batch([0, 5, 11, 23], codes), disk.batch([0, 5, 11, 23], codes)
+        for key in ("cond", "target", "phys", "mask", "scalars", "cone_id", "z"):
+            assert torch.equal(a[key], b[key]), f"{key} differs for codes {codes}"
+        loss_cpu, *_ = _batch_loss(model, a, (0.0, 1.0), 1.0)
+        loss_disk, *_ = _batch_loss(model, b, (0.0, 1.0), 1.0)
+        assert torch.equal(loss_cpu, loss_disk)
+
+    disk.close()
+
+
+def test_disk_storage_rows_survive_a_block_subset(tmp_path):
+    path = tmp_path / "cache.h5"
+    _write_memory_cache(path, n=24)
+    with h5py.File(path, "a") as h:
+        h["block"][:] = np.array([0, 0, 0, 1, 1, 1] * 4, np.int32)
+    cpu = LoReLiMemorySplit(path, "train", blocks=[1], storage="cpu")
+    disk = LoReLiMemorySplit(path, "train", blocks=[1], storage="disk")
+    assert np.array_equal(cpu.rows, disk.rows)
+    assert cpu.rows.tolist() == [3, 4, 5, 9, 10, 11, 15, 16, 17, 21, 22, 23]
+    for positions in ([0], [1, 4], [11, 0, 6]):
+        a, b = cpu.batch(positions, [2] * len(positions)), disk.batch(positions, [2] * len(positions))
+        assert torch.equal(a["cond"], b["cond"]) and torch.equal(a["mask"], b["mask"])
+        assert torch.equal(a["phys"], b["phys"])
+    disk.close()
 
 
 def test_padding_mask_is_the_valid_interior():
@@ -549,3 +615,150 @@ def test_trainer_smoke_builds_a_loreli_checkpoint(tmp_path):
     initial = load_model(reference)[1].state_dict()
     for name, tensor in initial.items():
         assert torch.allclose(zero_best["model"][name], tensor, atol=1e-9), name
+
+
+def test_trainer_disk_storage_is_bit_identical_and_resume_guarded(tmp_path):
+    """A full cpu run and a disk run (same seed) agree in batches, loss and weights."""
+    from ebm21cm.train_loreli_finetune import FinetuneConfig, run as train_run
+
+    model_config = {
+        "in_channels": 26, "out_channels": 2, "scalar_dim": 38,
+        "width": 8, "modes": 4, "n_steps": 2, "step_size": 0.5,
+    }
+    reference = tmp_path / "ref"
+    reference.mkdir()
+    torch.manual_seed(0)
+    torch.save({
+        "model": build_model(model_config).state_dict(), "model_config": model_config,
+        "head": "structured", "tb_norm": (0.0, 1.0), "step": 1,
+    }, reference / "best.pt")
+
+    split = make_split([10000 + i for i in range(228)], seed=0)
+    split_path = tmp_path / "split.json"
+    split_path.write_text(json.dumps(split))
+    info = load_split(split_path)
+    train_block, val_block = split["train_blocks"][0], split["val_blocks"][0]
+
+    domain, n_out = 32, 20
+    cache = tmp_path / "cache.h5"
+    n = 4
+    with h5py.File(cache, "w") as h:
+        h.create_dataset("cond", data=np.random.randn(n, 26, domain, domain).astype(np.float16))
+        h.create_dataset("target", data=np.random.rand(n, 2, domain, domain).astype(np.float16))
+        h.create_dataset("phys", data=np.ones((n, domain, domain), np.float16))
+        h.create_dataset("scalars", data=np.random.randn(n, 38).astype(np.float32))
+        h.create_dataset("mask", data=padding_mask(domain, n_out))
+        h.create_dataset("z", data=np.linspace(5, 15, n))
+        h.create_dataset("cone_id", data=np.array([10001, 10001, 10002, 10002], np.int64))
+        h.create_dataset("block", data=np.array([train_block, train_block, val_block, val_block], np.int32))
+        h.create_dataset("split", data=np.array([0, 0, 1, 1], np.int8))
+        h.attrs.update({"schema": SCHEMA, "domain": domain, "n_out": n_out,
+                        "split_sha256": info["sha256"]})
+
+    def config(storage, max_steps=2):
+        return FinetuneConfig(
+            max_steps=max_steps, min_steps=1, batch_size=2, eval_batch_size=2,
+            lr_new=1e-3, lr_pretrained=1e-3, min_lr=1e-5, val_every=1,
+            seed=0, threads=1, storage=storage,
+        )
+
+    cpu_dir, disk_dir = tmp_path / "run_cpu", tmp_path / "run_disk"
+    cpu = train_run(cache, cpu_dir, reference, freeze="decoder", split_file=split_path,
+                    config=config("cpu"), device="cpu", log=lambda *a: None)
+    disk = train_run(cache, disk_dir, reference, freeze="decoder", split_file=split_path,
+                     config=config("disk"), device="cpu", log=lambda *a: None)
+    assert cpu["storage"] == "cpu" and disk["storage"] == "disk"
+    assert cpu["disk_reads"] == 0 and disk["train_disk_reads"] > 0
+    assert disk["val_disk_reads"] == 0  # the validation split stays in RAM
+    assert disk["resident_bytes"] < cpu["resident_bytes"]
+    assert disk["dataset_bytes"] == cpu["dataset_bytes"] > 0
+    assert disk["resident_bytes"] < disk["dataset_bytes"]
+    for key in ("steps", "samples_seen", "best_step", "best_validation_score",
+                "trainable_parameters", "train_blocks"):
+        assert cpu[key] == disk[key], key
+    a = torch.load(cpu_dir / "best.pt", map_location="cpu", weights_only=False)["model"]
+    b = torch.load(disk_dir / "best.pt", map_location="cpu", weights_only=False)["model"]
+    assert set(a) == set(b)
+    for name in a:
+        assert torch.equal(a[name], b[name]), name
+
+    resumed = train_run(cache, disk_dir, reference, freeze="decoder", split_file=split_path,
+                        config=config("disk", max_steps=3), device="cpu", resume=True,
+                        log=lambda *a: None)
+    assert resumed["steps"] == 3
+
+    with pytest.raises(ValueError, match="resume"):
+        train_run(cache, disk_dir, reference, freeze="decoder", split_file=split_path,
+                  config=config("cpu", max_steps=3), device="cpu", resume=True, log=lambda *a: None)
+
+
+def test_cache_build_assigned_only_drops_unassigned_cones(tmp_path, monkeypatch):
+    import ebm21cm.data.loreli_cache as cache_mod
+
+    split = make_split([10000 + i for i in range(228)], seed=0)
+    split_path = tmp_path / "split.json"
+    split_path.write_text(json.dumps(split))
+    assigned = 10000 + 6 * split["train_blocks"][0]
+    unassigned = 99999
+    paths = {str(tmp_path / "a.dat"): assigned, str(tmp_path / "b.dat"): unassigned}
+
+    training = tmp_path / "training.h5"
+    with h5py.File(training, "w") as h:
+        h.attrs["bands"] = json.dumps([(-32, -16)] * 13)
+        h.attrs["normalization"] = json.dumps({"density": {"offset": 0, "scale": 1}})
+        h.attrs["param_names"] = json.dumps([f"p{i}" for i in range(11)])
+        h.attrs["scalar_names"] = json.dumps(
+            ["1/(1+z)"] + [f"p{i}" for i in range(11)] + [f"h{i}" for i in range(26)])
+    reference = tmp_path / "ref"
+    reference.mkdir()
+    torch.save({"model_config": {"in_channels": 26, "out_channels": 2, "scalar_dim": 38,
+                                 "width": 8, "modes": 4, "n_steps": 1},
+                "head": "structured", "tb_norm": (0.0, 1.0), "step": 1},
+               reference / "best.pt")
+
+    class FakeCone:
+        def __init__(self, path, **kwargs):
+            self.sim = paths[str(path)]
+
+    class FakeAdapter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    def fake_rows(cone, adapter, tb_norm, **kwargs):
+        sim = cone.sim
+        return {
+            "cond": np.zeros((1, 26, 280, 280), np.float16),
+            "target": np.zeros((1, 2, 280, 280), np.float16),
+            "phys": np.ones((1, 280, 280), np.float32),
+            "scalars": np.zeros((1, 38), np.float32),
+            "z": np.array([8.0]),
+            "los_index": np.array([0], np.int32),
+            "xhi_mean": np.array([0.5], np.float32),
+            "stage": np.array([1], np.int8),
+            "background": np.array([False]),
+        }, {"cone_id": sim, "n_rows": 1, "n_active": 1}
+
+    monkeypatch.setattr(cache_mod, "LoreliCone", FakeCone)
+    monkeypatch.setattr(cache_mod, "LoreliAdapter", FakeAdapter)
+    monkeypatch.setattr(cache_mod, "rows_from_cone", fake_rows)
+    monkeypatch.setattr(cache_mod, "loreli_files",
+                        lambda data: ([Path(p) for p in paths], list(paths.values())))
+    monkeypatch.setattr(cache_mod, "read_cube", lambda path: None)
+
+    kept = cache_mod.build(tmp_path / "kept.h5", tmp_path, training, reference, split_path,
+                           device="cpu", assigned_only=True, log=lambda *a: None)
+    assert kept["n_rows"] == 1
+    with h5py.File(tmp_path / "kept.h5", "r") as h:
+        assert int(h.attrs["n_cones"]) == 1
+        assert int(h.attrs["n_unassigned"]) == 0
+        assert bool(h.attrs["assigned_only"])
+        assert int(h["split"][:].min()) >= 0
+        assert int(h.attrs["n_rows"]) == 1
+
+    cache_mod.build(tmp_path / "all.h5", tmp_path, training, reference, split_path,
+                    device="cpu", log=lambda *a: None)
+    with h5py.File(tmp_path / "all.h5", "r") as h:
+        assert int(h.attrs["n_rows"]) == 2
+        assert int(h.attrs["n_unassigned"]) == 1
+        assert int(h.attrs["n_cones"]) == 2
+        assert int(h["split"][:].min()) == -1
