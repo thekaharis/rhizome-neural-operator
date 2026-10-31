@@ -429,7 +429,7 @@ def write_markdown(path, result):
              f"Selection is `ebm21cm.evaluate_loreli`'s: border {result['border_resampled_cells']} resampled cells "
              f"-> crop index {result['crop_border_index']}, {result['crop_cells_per_side']} cells per side "
              f"({result['cells_per_slice']} per slice), LOS margin {result['los_margin']}, stage by the true slice "
-             f"mean. Maps are fitted on the 28 train blocks only "
+             f"mean. Maps are fitted on the {result['split_blocks']['train']} train blocks only "
              f"({result['split_cones']['train']} cones).", "",
              "Matched floor (degraded 21cmFAST, 199 cones): native "
              + " / ".join(f"{FLOOR[s]['0.0']:.4f}" for s, _, _ in lm.STAGES)
@@ -533,7 +533,7 @@ def plot_maps(path, result):
         ax.grid(alpha=0.3)
         ax.legend(fontsize=7, loc="upper left")
     axes[0].set_ylabel("mapped x_HI (fitted truth)")
-    fig.suptitle("LoReLi zero-shot monotone output maps, fitted on the 28 train blocks")
+    fig.suptitle(f"LoReLi zero-shot monotone output maps, fitted on the {result['split_blocks']['train']} train blocks")
     fig.tight_layout()
     fig.savefig(path, dpi=140)
     plt.close(fig)
