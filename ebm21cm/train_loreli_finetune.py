@@ -321,6 +321,7 @@ def run(
     val_loader = val.loader(config.eval_batch_size)
 
     step, samples, elapsed, history, stopped = 0, 0, 0.0, [], False
+    step_seconds = 0.0
     if resume:
         checkpoint = torch.load(run_dir / "last.pt", map_location="cpu", weights_only=False)
         if checkpoint["signature"] != signature:
@@ -330,6 +331,7 @@ def run(
         stream.load_state_dict(checkpoint["stream"])
         torch.set_rng_state(checkpoint["torch_rng"])
         step, samples, elapsed = checkpoint["step"], checkpoint["samples_seen"], checkpoint["elapsed_seconds"]
+        step_seconds = float(checkpoint.get("train_step_seconds", 0.0))
         plateau = PlateauState(**checkpoint["plateau"])
         best_model, history, stopped = checkpoint["best_model"], checkpoint["history"], checkpoint["stopped"]
         log(f"resumed at step {step}; best validation score {plateau.best:.6f}")
@@ -364,6 +366,7 @@ def run(
             "signature": signature, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
             "stream": stream.state_dict(), "torch_rng": torch.get_rng_state(),
             "step": step, "samples_seen": samples, "elapsed_seconds": saved,
+            "train_step_seconds": step_seconds,
             "plateau": asdict(plateau), "best_model": best_model, "history": history,
             "stopped": stopped,
         }, run_dir / "last.pt")
@@ -385,6 +388,7 @@ def run(
     )
     while step < config.max_steps and not stopped:
         model.train()
+        tick = time.perf_counter()
         batch = stream.next()
         batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
         optimizer.zero_grad(set_to_none=True)
@@ -397,6 +401,7 @@ def run(
             1.0, error_if_nonfinite=True,
         )
         optimizer.step()
+        step_seconds += time.perf_counter() - tick
         step += 1
         samples += int(batch["cond"].shape[0])
         if step % config.val_every == 0:
@@ -438,6 +443,8 @@ def run(
         "train_disk_reads": train.io_stats["reads"],
         "val_disk_reads": val.io_stats["reads"],
         "seconds_per_step": seconds / step if step else None,
+        "train_step_seconds": step_seconds,
+        "milliseconds_per_step": 1000.0 * step_seconds / step if step else None,
     }
     (run_dir / "results.json").write_text(json.dumps(result, indent=2))
     log(json.dumps(result, indent=2))

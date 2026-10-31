@@ -673,6 +673,7 @@ def test_trainer_disk_storage_is_bit_identical_and_resume_guarded(tmp_path):
     assert disk["resident_bytes"] < cpu["resident_bytes"]
     assert disk["dataset_bytes"] == cpu["dataset_bytes"] > 0
     assert disk["resident_bytes"] < disk["dataset_bytes"]
+    assert cpu["milliseconds_per_step"] > 0 and disk["milliseconds_per_step"] > 0
     for key in ("steps", "samples_seen", "best_step", "best_validation_score",
                 "trainable_parameters", "train_blocks"):
         assert cpu[key] == disk[key], key
