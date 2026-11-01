@@ -1,6 +1,6 @@
 # LoReLi II integration figures
 
-PDF for LaTeX, PNG (200-300 dpi) for slides. Scripts in `src/`; run them from the worktree
+PDF for LaTeX, PNG (200-300 dpi) for slides. Scripts in `src/`; run them from the repository
 root (`rhizome-neural-operator`) with the project environment (`source slurm/_env.sh`) on a
 compute node (`srun -p compute -c 8 --mem=80G`).
 
@@ -20,6 +20,13 @@ compute node (`srun -p compute -c 8 --mem=80G`).
 | `decoder_b8_v3/dec_power` | Transverse P_pred/P_true and cross-correlation r(k) by stage | v3 |
 | `decoder_b8_v3/dec_decoder_change` | Relative weight change of the 1x1-conv decoder; learned remap reference -> fine-tuned (x_HI, logit, T_b) | v3 |
 | `loreli_v3_b8_decoder_test_predictions` | Test cone 12316: truth vs zero-shot reference vs fine-tuned (8 blocks, decoder arm), emulated histories, per-panel RMSE | v3 cache + v3 side file |
+| `cm21eval/cm21_scorecard` | 21cmEVAL headline metrics per model: pooled x_HI / T_b RMSE, IoU, r(k=0.2), power ratio, Δτ, Δz(0.5), front width; median over the 30 test cones with 16-84 % and per-cone dots (numbers in `cm21_scorecard.json`) | `runs/cm21eval` |
+| `cm21eval/cm21_per_cone_rmse` | x_HI and T_b RMSE per test lightcone, connected across models, coloured by redshift group | `runs/cm21eval` |
+| `cm21eval/cm21_spectra_{xhi,tb}` | Transverse P_pred/P_true and r(k) for the five x_HI stages + active, median over cones | `runs/cm21eval` |
+| `cm21eval/cm21_bubbles` | Mean-free-path bubble-size distributions per stage, truth vs models | `runs/cm21eval` |
+| `cm21eval/cm21_history` | τ, z(0.5), duration pred vs truth per cone; history errors; one example history per group | `runs/cm21eval` |
+| `cm21eval/cm21_fronts` | Mean x_HI and RMSE vs distance to the true ionization front; 10-90 % front width per cone | `runs/cm21eval` |
+| `cm21eval/cm21_eft_morphology` | EFT transfer / stochasticity / r(k) relative to truth (k <= 0.5); 3-D IoU vs ionized fraction; region counts and radii | `runs/cm21eval` |
 
 Figures marked **v2** document the state before the LOS-axis fix (wrong per-row redshifts,
 oracle histories); they belong to `LoReLi_integration_report.pdf` (1 Nov 2026) and are
@@ -35,6 +42,11 @@ python docs/figures/loreli/src/make_loreli_test_predictions.py \
     runs/loreli_finetune/l294v3_b8_decoder_emu_seed0 \
     docs/figures/loreli/loreli_v3_b8_decoder_test_predictions.png
 ```
+
+The `cm21eval/` set (CPU, < 1 min; skips models whose 21cmEVAL runs are incomplete, so rerun it as
+the ladders finish): `python docs/figures/loreli/src/make_loreli_cm21eval_figs.py [runs/cm21eval] [docs/figures/loreli/cm21eval]`.
+21cmEVAL pools nothing across the four redshift groups; the script concatenates per-cone curves over all
+groups (median, 16-84 %) and pools voxel RMSE exactly.
 
 The `decoder_b8_v3/` set: `python docs/figures/loreli/src/make_loreli_decoder_viz.py <run_dir> <out_dir> [--stride 3]`
 (GPU, ~6 min on an A30; writes `decoder_viz_data.npz`, then `--plot-only` re-plots on CPU). Works for any ladder run.
