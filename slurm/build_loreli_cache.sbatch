@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the LoReLi fine-tuning slice cache with the evaluation adapter.
-#   ARGS="--out /pfs/.../runs/loreli_cache/loreli_slices_l294_v2.h5 \
+#   ARGS="--out /pfs/.../data/compressed/loreli_slices_l294_v3.h5 \
 #     --split-file .../block_split_v2_seed0.json --assigned-only ..." \
 #     sbatch --export=ALL,ARGS="$ARGS" slurm/build_loreli_cache.sbatch
 #SBATCH --job-name=loreli-cache

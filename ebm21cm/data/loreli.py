@@ -2,8 +2,10 @@
 
 A five-field file holds ``(128, 128, 1536, 5)`` little-endian float32 with the
 fields interleaved per voxel: ``xa, tpHI, xion, dens, dtb``. Index 0 is the
-low-redshift end. The line of sight is uniform in comoving distance from z = 5
-to z = 15 (1536 cells, 1.639 Mpc); ``dtb`` is in mK and has no velocity-gradient
+low-redshift end. The line of sight is **uniform in redshift** from z = 5 to
+z = 15 (1536 planes, dz = 10/1535; comoving spacing 3.50 Mpc at z = 5 down to
+0.81 Mpc at z = 15) - verified against the 21ssd box histories (see
+:func:`loreli_redshifts`); ``dtb`` is in mK and has no velocity-gradient
 term. Empty tails below the redshift at which the simulation stopped have
 ``dens = 0`` and ``dtb = NaN``.
 
@@ -46,16 +48,24 @@ LORELI_L_PERP = 294.0            # LoReLi I Table 1; LoReLi II writes 300
 DOMAIN = 280                     # 400 Mpc, twice the 200 Mpc training box
 HISTORY_TB_SCALE = 100.0         # fno-21cm's T_b history channel is T_b [mK] / 100
 TRAINING_CELL_MPC = 200.0 / 140   # the slice cache's 1.4286 Mpc transverse/LOS cell
+DTB_ABS_MAX = 1.0e3              # mK; planes with larger |dTb| are corrupt and invalid
 
 
 def loreli_redshifts(z_range=LORELI_Z, n=LORELI_N_LOS, omega_m=LORELI_OMEGA_M, h=LORELI_H):
-    """(z, distance from z_min) of the uniform-in-comoving-distance LOS axis."""
+    """(z, comoving distance from z_min) of LoReLi's LOS planes: **uniform in redshift**.
+
+    The axis was first assumed uniform in comoving distance.  On the 228 five-field
+    cones the 21ssd box diagnostics decide it: slice-mean vs box x_HI agree to 0.016
+    RMS on a uniform-z axis (0.19 comoving, 0.25 uniform frequency); inverting each
+    cone's box x_HI(z) recovers z(plane) to 0.07 RMS (comoving: 1.0); global vs
+    slice-mean dTb 3.5 vs 28 mK; and the LOS lag-1 density correlation rises along
+    the cone as the plane spacing shrinks (3.5 Mpc at z = 5, 0.81 Mpc at z = 15).
+    """
     cosmo = FlatLCDM(omega_m, h)
     z0, z1 = z_range
-    chi = np.linspace(cosmo.comoving_distance(z0), cosmo.comoving_distance(z1), n)
-    distance = chi - chi[0]
-    z = cosmo.z_at_distance(chi)
-    return z, distance
+    z = np.linspace(float(z0), float(z1), int(n))
+    chi = np.asarray(cosmo.comoving_distance(z), np.float64)
+    return z, chi - chi[0]
 
 
 def loreli_files(root):
@@ -185,8 +195,10 @@ def velocity_shape(delta, cell=TRAINING_CELL_MPC, cell_los=None):
     """Geometric part of the linear-theory LOS velocity: ``i k_par delta_k / k^2`` (1/Mpc).
 
     Multiply by :func:`hubble_growth` at the slice redshift for comoving Mpc/s.
-    ``delta`` is (ny, nx, n) and is treated as periodic; the transverse and LOS
-    spacings may differ (LoReLi's native grid is 2.297 x 1.6397 Mpc).
+    ``delta`` is (ny, nx, n) on a *uniform* grid and is treated as periodic; the
+    transverse and LOS spacings may differ.  LoReLi's native planes are not uniform
+    in distance, so :class:`LoreliAdapter` resamples delta to a uniform comoving LOS
+    grid before calling this.
     """
     ny, nx, nz = delta.shape
     cell_los = cell if cell_los is None else cell_los
@@ -275,7 +287,12 @@ class LoreliCone:
         """Nonempty slices of the one contiguous run that holds the cone, with edge artefacts removed."""
         dens = np.array(self.data[..., FIELDS.index("dens")], dtype=np.float32)
         mean = dens.mean((0, 1))
-        valid = np.isfinite(np.array(self.data[..., FIELDS.index("dtb")], np.float32)).all((0, 1)) & (mean > 0)
+        dtb = np.array(self.data[..., FIELDS.index("dtb")], np.float32)
+        finite = np.isfinite(dtb).all((0, 1))
+        # Corrupt planes exist (cone 13221: |dTb| up to 1e12 mK next to the empty tail); physical |dTb| < ~300 mK.
+        sane = np.where(np.isfinite(dtb), np.abs(dtb), 0).max((0, 1)) < DTB_ABS_MAX
+        del dtb
+        valid = finite & sane & (mean > 0)
         if valid.any():
             # The first/last slice of a particle lightcone can hold a partly filled plane (18% low in density);
             # interior slice means fluctuate by a few percent (large-scale modes), so a 10% cut removes the
@@ -390,28 +407,45 @@ class LoreliAdapter:
             self._vel_shape, self._vel0 = self._precompute_velocity()
 
     def _precompute_velocity(self):
-        """Geometric velocity shape over the valid native run; one FFT, mirror-padded in LOS.
+        """Geometric velocity shape on a uniform comoving LOS grid; one FFT.
 
-        The z-dependent H(z) f(z) factor is applied per target slice after
-        resampling, so the amplitude follows the lightcone without chunk seams.
+        The native planes are uniform in z, so their comoving spacing varies along
+        the cone and the FFT cannot run on them.  delta over the valid run (plus the
+        band halo in planes, for context) is resampled onto multiples of
+        ``cell_los`` - the target grid's own points - and transformed there;
+        :meth:`_target` reads the velocity at the target positions directly.  The
+        z-dependent H(z) f(z) factor is applied per target slice afterwards, so the
+        amplitude follows the lightcone without chunk seams.  Returns
+        ``(shape, k0)``: column ``j`` of ``shape`` is at distance ``(k0 + j) * cell_los``.
         """
         first, last = np.flatnonzero(self.cone.valid)[[0, -1]]
         lo, hi = max(0, first - self.halo), min(self.cone.n_los, last + self.halo + 1)
+        distances = self.cone.distances[lo:hi]
+        k0 = int(np.ceil(distances[0] / self.cell_los - 1e-9))
+        k1 = int(np.floor(distances[-1] / self.cell_los + 1e-9))
+        grid = np.arange(k0, k1 + 1) * self.cell_los
         dense = self.cone.delta(self.cone.read(lo, hi, fields=("dens",))["dens"])
+        dense = resample_los(dense, distances, grid)
         if self.torch_inputs:
             shape = velocity_shape_torch(dense, cell=self.l_perp / self.cone.n_native,
-                                         cell_los=float(np.median(np.diff(self.cone.distances))),
-                                         device=self.device)
+                                         cell_los=self.cell_los, device=self.device)
         else:
-            shape = velocity_shape(dense, cell=self.l_perp / self.cone.n_native,
-                                   cell_los=float(np.median(np.diff(self.cone.distances))))
-        return shape, lo
+            shape = velocity_shape(dense, cell=self.l_perp / self.cone.n_native, cell_los=self.cell_los)
+        return shape, k0
 
     def _native(self, start, stop):
         raw = self.cone.read(start, stop, fields=("dens", "los_velocity"))
-        velocity = (self._vel_shape[:, :, start - self._vel0:stop - self._vel0]
-                    if self.velocity == "linear" else raw["los_velocity"])
-        return {"delta": self.cone.delta(raw["dens"]), "los_velocity": velocity}
+        return {"delta": self.cone.delta(raw["dens"]), "los_velocity": raw["los_velocity"]}
+
+    def _velocity_at(self, distance):
+        """Linear velocity shape (native transverse grid) at target distances (multiples of ``cell_los``)."""
+        k = np.rint(np.asarray(distance) / self.cell_los).astype(np.int64)
+        if not np.allclose(k * self.cell_los, distance, atol=1e-6):
+            raise ValueError("velocity requested off the uniform target grid")
+        j = k - self._vel0
+        if j.min() < 0 or j.max() >= self._vel_shape.shape[-1]:
+            raise ValueError("velocity requested outside the precomputed LOS range")
+        return self._vel_shape[:, :, j]
 
     def _target(self, a, b):
         """Resampled delta and velocity for target positions [lo, hi) that contain [a, b) plus the halo."""
@@ -425,6 +459,11 @@ class LoreliAdapter:
         native = self._native(n0, n1)
         out = {}
         for key in ("delta", "los_velocity"):
+            if key == "los_velocity" and self.velocity == "linear":
+                los = self._velocity_at(distance)
+                out[key] = (resample_transverse_torch(los, self.n_out, self.device)
+                            if self.torch_inputs else resample_transverse(los, self.n_out))
+                continue
             value = native[key]
             if value is not None:
                 los = resample_los(value, self.cone.distances[n0:n1], distance)

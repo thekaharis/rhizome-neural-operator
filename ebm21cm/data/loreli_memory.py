@@ -38,6 +38,19 @@ from .loreli_cache import SCHEMA
 from .memory import _Loader, dihedral
 
 
+SIDE_SCHEMA = "ebm21cm-loreli-scalars-v1"
+
+
+def side_scalars(path, cone_id, los_index):
+    """Scalars from a side file (e.g. emulated histories), checked row by row against the cache."""
+    with h5py.File(path, "r") as s:
+        if s.attrs.get("schema") != SIDE_SCHEMA:
+            raise ValueError(f"{path}: not an {SIDE_SCHEMA} scalar file")
+        if not (np.array_equal(s["cone_id"][:], cone_id) and np.array_equal(s["los_index"][:], los_index)):
+            raise ValueError(f"{path}: rows do not match the cache (cone_id / los_index differ)")
+        return s["scalars"][:]
+
+
 class LoReLiMemorySplit:
     """One split (optionally a subset of training blocks) on ``storage``.
 
@@ -55,6 +68,7 @@ class LoReLiMemorySplit:
         storage="cpu",
         device="cpu",
         block_rows: int = 128,
+        scalars_file=None,
     ):
         self.path, self.split = str(path), split
         self.device = torch.device(device)
@@ -90,7 +104,10 @@ class LoReLiMemorySplit:
                         for key, array in arrays.items():
                             array[pos:pos + b - a] = h[key][a:b]
                         pos += b - a
-            self.scalars = torch.from_numpy(h["scalars"][:][rows].astype(np.float32)).to(self.storage)
+            scalars = h["scalars"][:]
+            if scalars_file:
+                scalars = side_scalars(scalars_file, h["cone_id"][:], h["los_index"][:])
+            self.scalars = torch.from_numpy(scalars[rows].astype(np.float32)).to(self.storage)
             self.mask = torch.from_numpy(h["mask"][:].astype(bool)).to(self.storage)
             self.z = h["z"][:][rows]
             self.cone_id = h["cone_id"][:][rows]

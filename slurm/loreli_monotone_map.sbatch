@@ -12,8 +12,8 @@
 #SBATCH --error=logs/loreli-monotone-%j.err
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_env.sh" 2>/dev/null || source slurm/_env.sh
-# scikit-learn is not installed in fno-env; a no-deps copy lives outside the repo at handoff/pylibs.
-export PYTHONPATH="/pfs/10/work/hd_id260-fno_training/handoff/pylibs:${PYTHONPATH:-}"
+# scikit-learn is not installed in fno-env; a no-deps copy lives in the git-ignored .pylibs/ of the repo.
+export PYTHONPATH="$PROJECT_ROOT/.pylibs:${PYTHONPATH:-}"
 mkdir -p logs
 python scripts/loreli_monotone_map.py \
   --pred runs/eval3d/loreli_lc128/rhizome_mf2d_w64_structured_all_full_v2 \

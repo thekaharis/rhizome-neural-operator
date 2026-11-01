@@ -5,7 +5,9 @@ the tensor the reference model receives when the same cone and target slice are
 evaluated: 26 normalized density/velocity bands, 38 scalars, and the structured
 head's physical factor on the 280-cell domain.
 
-Targets are resampled to the same 206-cell (L=294) / 1.4286 Mpc grid, then
+The LOS axis is LoReLi's true one (uniform in z, see ``loreli_redshifts``); caches
+built before 2026-11-01 (``*_v2``) used a uniform-comoving axis and carry wrong
+redshifts and LOS scales.  Targets are resampled to the same 206-cell (L=294) / 1.4286 Mpc grid, then
 mirror-padded to 280 exactly like the conditioning.  A single 2-D mask marks the
 206-cell interior; the mirrored border is stored but ignored by the loss and by
 every metric.
@@ -25,7 +27,7 @@ the histories are LoReLi's own.  ``parameter_mode`` records that choice.
 Build::
 
     python -m ebm21cm.data.loreli_cache build \
-        --out runs/loreli_cache/loreli_slices_l294_v2.h5 \
+        --out /pfs/.../data/compressed/loreli_slices_l294_v3.h5 \
         --data /pfs/.../data/loreli_lc128 \
         --training-cache /pfs/.../compressed/rhizome_mf_slices_all.h5 \
         --run /pfs/.../runs/rhizome_mf2d_w64_structured_all \
@@ -69,6 +71,7 @@ SCHEMA = "ebm21cm-loreli-slices-v1"
 SPLIT_ID = {"train": 0, "val": 1, "test": 2}
 DOMAIN = 280
 ACTIVE_RANGE = (0.02, 0.98)
+FLOAT16_LIMIT = 6.0e4
 
 
 def padding_mask(domain: int = DOMAIN, n_out: int | None = None, l_perp: float = 294.0) -> np.ndarray:
@@ -210,6 +213,13 @@ def rows_from_cone(
             x = np.moveaxis(pad_to(x, domain), -1, 0)[:, None]
             t = np.moveaxis(pad_to(t, domain), -1, 0)[:, None]
             target = np.concatenate([x, t], axis=1)
+            # Check before the float16 cast: after it, an overflow is indistinguishable from a NaN.
+            for name, value in (("cond", cond[take]), ("target", target)):
+                if not np.all(np.isfinite(value)):
+                    raise ValueError(f"non-finite {name}")
+                peak = float(np.abs(value).max())
+                if peak > FLOAT16_LIMIT:
+                    raise ValueError(f"float16 overflow in {name} (max |value| {peak:.3g})")
             conds.append(cond[take].astype(np.float16))
             targets.append(target.astype(np.float16))
             physs.append(phys[take, 0].astype(np.float32))

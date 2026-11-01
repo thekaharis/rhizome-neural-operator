@@ -46,17 +46,60 @@ def write_cone(path, n_native=16, n_los=32, seed=0, tail=4):
     return cube
 
 
-def test_redshifts_are_uniform_in_comoving_distance():
+def test_redshifts_are_uniform_in_z():
+    # LoReLi's planes are uniform in redshift (checked against the 21ssd box histories), so the
+    # comoving spacing shrinks from ~3.5 Mpc at z = 5 to ~0.8 Mpc at z = 15.
     z, distance = loreli_redshifts((5.0, 15.0), 1536)
-    assert z[0] == pytest.approx(5.0, abs=1e-12) and z[-1] == pytest.approx(15.0, abs=1e-10)
-    assert np.all(np.diff(z) > 0)
+    assert z[0] == 5.0 and z[-1] == 15.0
+    assert np.allclose(np.diff(z), 10.0 / 1535, rtol=1e-12)
     from ebm21cm.cosmology import FlatLCDM
 
+    cosmo = FlatLCDM(0.308, 0.678)
+    assert distance[0] == 0.0
+    assert distance[-1] == pytest.approx(cosmo.comoving_distance(15.0) - cosmo.comoving_distance(5.0), rel=1e-9)
     step = np.diff(distance)
-    exact = (FlatLCDM(0.308, 0.678).comoving_distance(15.0)
-             - FlatLCDM(0.308, 0.678).comoving_distance(5.0)) / 1535
-    assert step.min() == pytest.approx(step.max(), rel=1e-10)
-    assert step.mean() == pytest.approx(exact, rel=1e-12)
+    assert np.all(step > 0) and np.all(np.diff(step) < 0)
+    assert step[0] == pytest.approx(3.50, abs=0.02) and step[-1] == pytest.approx(0.81, abs=0.02)
+
+
+def test_linear_velocity_on_the_nonuniform_uniform_z_axis(tmp_path):
+    """The velocity FFT runs on a uniform comoving grid, although LoReLi's planes are uniform in z.
+
+    delta = A cos(kx x) cos(kz chi) gives v = -A H f kz / (kx^2 + kz^2) cos(kx x) sin(kz chi).
+    """
+    from ebm21cm.data.loreli import hubble_growth
+
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00011.dat"
+    n_native, n_los, z_range, amp, wavelength = 8, 384, (5.0, 9.0), 0.3, 120.0
+    _, chi = loreli_redshifts(z_range, n_los)
+    kz, kx = 2 * np.pi / wavelength, 2 * np.pi / 294.0
+    x = np.arange(n_native) * 294.0 / n_native
+    cube = np.zeros((n_native, n_native, n_los, 5), np.float32)
+    cube[..., 0], cube[..., 1], cube[..., 2], cube[..., 4] = 1.0, 100.0, 0.5, 5.0
+    cube[..., 3] = 1e-9 * (1 + amp * np.cos(kx * x)[:, None, None] * np.cos(kz * chi)[None, None, :])
+    cube.tofile(path)
+    cone = LoreliCone(path, z_range=z_range, n_native=n_native, n_los=n_los)
+    spacing = np.diff(cone.distances)
+    assert spacing.max() / spacing.min() > 1.5 and cone.valid.sum() > 370
+    adapter = LoreliAdapter(cone, REAL_STATS, velocity="linear", device="cpu")
+    n = len(adapter.target_distance)
+    a, b = n // 6, 5 * n // 6                               # away from the FFT's periodic seam
+    d = adapter.target_distance[a:b]
+    velocity = adapter._velocity_at(d)[0, 0] * hubble_growth(adapter.z_target[a:b])
+    expected = -amp * kz / (kx ** 2 + kz ** 2) * np.sin(kz * d) * hubble_growth(adapter.z_target[a:b])
+    assert np.max(np.abs(velocity - expected)) < 0.01 * np.max(np.abs(expected))
+    with pytest.raises(ValueError):
+        adapter._velocity_at(d[:3] + 0.3)                   # off the uniform target grid
+
+
+def test_corrupt_dtb_planes_are_invalid(tmp_path):
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00012.dat"
+    cube = write_cone(path, n_native=8, n_los=40, tail=4)
+    cube[3, 3, 20, 4] = 1.0e12                              # one absurd cell in an interior plane
+    cube.tofile(path)
+    cone = LoreliCone(path, z_range=(5.0, 5.4), n_native=8, n_los=40)
+    assert not cone.valid[20]
+    assert cone.valid[21:].all() and not cone.valid[:21].any()   # longest clean run kept
 
 
 def test_reader_orientation_and_validity_mask(tmp_path):

@@ -7,7 +7,7 @@ checkpoint with the 24 -> 48 mode remap, or from random init for the scratch
 control.
 
     python -m ebm21cm.train_loreli_finetune \
-        --cache runs/loreli_cache/loreli_slices_l294_v2.h5 \
+        --cache /pfs/.../data/compressed/loreli_slices_l294_v3.h5 \
         --run-dir runs/loreli_finetune/l294_b8_decoder_seed0 \
         --init-from runs/rhizome_mf2d_w64_structured_all \
         --split-file runs/loreli_splits/block_split_v2_seed0.json \
@@ -83,6 +83,7 @@ class FinetuneConfig:
     train_blocks: int = 0
     # cpu = host RAM (default), device = GPU, disk = per-batch HDF5 reads.
     storage: str = "cpu"
+    scalars_file: str = ""      # side file replacing the cache's scalars (e.g. emulated histories)
 
     def validate(self) -> None:
         for name in ("max_steps", "min_steps", "batch_size", "eval_batch_size",
@@ -200,6 +201,7 @@ def evaluate(model, loader, device, tb_norm, tb_weight, head="structured"):
 def _signature(cache, init_from, config, freeze, train_blocks, split, source_root, *, scratch, device):
     return {
         "cache_sha256": _sha256(cache),
+        "scalars_sha256": _sha256(config.scalars_file) if config.scalars_file else None,
         "init_from": str(Path(init_from).resolve()),
         "checkpoint_sha256": _sha256(Path(init_from) / "best.pt"),
         "freeze": freeze,
@@ -299,8 +301,11 @@ def run(
     else:
         train_storage = val_storage = torch.device("cpu")
     t0 = time.perf_counter()
-    train = LoReLiMemorySplit(cache, "train", blocks=train_blocks, storage=train_storage, device=device)
-    val = LoReLiMemorySplit(cache, "val", blocks=split["val_blocks"], storage=val_storage, device=device)
+    side = config.scalars_file or None
+    train = LoReLiMemorySplit(cache, "train", blocks=train_blocks, storage=train_storage, device=device,
+                              scalars_file=side)
+    val = LoReLiMemorySplit(cache, "val", blocks=split["val_blocks"], storage=val_storage, device=device,
+                            scalars_file=side)
     if scalar_keep is not None:
         keep = torch.as_tensor(scalar_keep, dtype=torch.long)
         train.scalars = train.scalars[:, keep]
