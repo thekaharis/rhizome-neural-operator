@@ -20,19 +20,15 @@ compute node (`srun -p compute -c 8 --mem=80G`).
 | `decoder_b8_v3/dec_power` | Transverse P_pred/P_true and cross-correlation r(k) by stage | v3 |
 | `decoder_b8_v3/dec_decoder_change` | Relative weight change of the 1x1-conv decoder; learned remap reference -> fine-tuned (x_HI, logit, T_b) | v3 |
 | `loreli_v3_b8_decoder_test_predictions` | Test cone 12316: truth vs zero-shot reference vs fine-tuned (8 blocks, decoder arm), emulated histories, per-panel RMSE | v3 cache + v3 side file |
-| `cm21eval/cm21_scorecard` | 21cmEVAL headline metrics per model: pooled x_HI / T_b RMSE, IoU, r(k=0.2), power ratio, Δτ, Δz(0.5), front width; median over the 30 test cones with 16-84 % and per-cone dots (numbers in `cm21_scorecard.json`) | `runs/cm21eval` |
-| `cm21eval/cm21_per_cone_rmse` | x_HI and T_b RMSE per test lightcone, connected across models, coloured by redshift group | `runs/cm21eval` |
-| `cm21eval/cm21_spectra_{xhi,tb}` | Transverse P_pred/P_true and r(k) for the five x_HI stages + active, median over cones | `runs/cm21eval` |
-| `cm21eval/cm21_bubbles` | Mean-free-path bubble-size distributions per stage, truth vs models | `runs/cm21eval` |
-| `cm21eval/cm21_history` | τ, z(0.5), duration pred vs truth per cone; history errors; one example history per group | `runs/cm21eval` |
-| `cm21eval/cm21_fronts` | Mean x_HI and RMSE vs distance to the true ionization front; 10-90 % front width per cone | `runs/cm21eval` |
+| `cm21eval_viz/<set>/summary_*` | 21cmEVAL `cm21eval plot summary`: scorecard (pooled x_HI / T_b RMSE, IoU, r(k=0.2), power ratio, Δτ, Δz(0.5), front width; `summary_scorecard.json`), per-cone RMSE, transverse spectra per stage, bubble sizes, history, fronts, EFT + morphology; pooled over the four redshift groups | `runs/cm21eval/<model>/<group>/{xhi,tb}` |
+| `cm21eval_viz/<set>/cyl_error_{xhi,tb}` | 21cmEVAL `cylindrical` metric + `cm21eval plot cyl`: P_pred/P_true - 1 over (k_perp, k_par), stage chunks x_HI-bar 0.9...0.1, hatched beyond LoReLi's native resolution; identical (1e-7) to `native_cyl` on the same chunks | `runs/cm21eval/<model>/viz/...` |
+| `cm21eval_viz/ref_vs_b8_pointwise/{gallery,deltas}/` | 21cmEVAL `gallery` metric + `cm21eval plot gallery/deltas`: per-cone gallery (all 30 test cones) and prediction - truth pages, the `compare_cones3d` / `delta_slices` layouts | `runs/cm21eval/<model>/viz/...` |
+| sets | `ref_vs_b8_pointwise/` (every figure), `all_models/` (cyl + summary, all 13 models incl. the 44-block arms); labels/colours from `src/cm21eval_style.json` | |
 | `eval3d/native_cyl/loreli_v3_*_cyl_error_{xhi,tb}` | Cylindrical power error P_pred/P_true - 1 (white within +-0.1), native LOS resolution, cone median, rows = models: `ebm21cm.plot_cyl_error` on `ebm21cm.native_cyl` output, the same tool and parameters as the 21cmFAST maps in `runs/eval3d/native_cyl/` | `data/eval_cubes/loreli_v3_<model>` |
 | `eval3d/native_cyl/loreli_v3_cyl_error_stage_{xhi,tb}` | The same error maps with chunks centred per cone at x_HI-bar 0.9/0.7/0.5/0.3/0.1 (`native_cyl` stage mode); hatched: beyond LoReLi's native resolution (2.3 Mpc transverse, 1.6-3.1 Mpc LOS), not counted | `runs/eval3d/native_cyl/stage/` |
 | `eval3d/native_cyl/native_cyl_error_stage_{xhi,tb}` | 21cmFAST baseline in the same stage layout: plain `rhizome_mf2d_w64_structured_all` (the LoReLi reference) and its `pw0.03_px0.03` power-loss variant, 199 test cones | `runs/eval3d/native_cyl/stage/` |
 | `eval3d/loreli_cones/cone_<id>` | Gallery per cone: rows = stages (x_HI-bar 0.8/0.6/0.4/0.2); x_HI (viridis) and T_b (magma) truth, models, model - truth, slice RMSE per panel: `ebm21cm.compare_cones3d` | `data/eval_cubes/loreli_v3_<model>` |
 | `eval3d/loreli_deltas/<group>/cone_<id>_deltas`, `overview_deltas` | Prediction - truth per slice at x_HI-bar 0.2/0.4/0.6/0.8: `ebm21cm.delta_slices` | `data/eval_cubes/loreli_v3_<model>` |
-| `cm21eval_ref_vs_b8_pointwise/cm21_*` | The same eight 21cmEVAL figures restricted to the reference and the 8-block pointwise arm (`--models reference b8_pointwise`) | `runs/cm21eval` |
-| `cm21eval/cm21_eft_morphology` | EFT transfer / stochasticity / r(k) relative to truth (k <= 0.5); 3-D IoU vs ionized fraction; region counts and radii | `runs/cm21eval` |
 
 Figures marked **v2** document the state before the LOS-axis fix (wrong per-row redshifts,
 oracle histories); they belong to `LoReLi_integration_report.pdf` (1 Nov 2026) and are
@@ -49,8 +45,19 @@ python docs/figures/loreli/src/make_loreli_test_predictions.py \
     docs/figures/loreli/loreli_v3_b8_decoder_test_predictions.png
 ```
 
-The `cm21eval/` set (CPU, < 1 min; skips models whose 21cmEVAL runs are incomplete, so rerun it as
-the ladders finish): `python docs/figures/loreli/src/make_loreli_cm21eval_figs.py [runs/cm21eval] [docs/figures/loreli/cm21eval]`.
+The `cm21eval_viz/` sets come from 21cmEVAL itself (`cm21eval plot`, ~2 min on a compute node). The
+`cylindrical` and `gallery` metrics run as an extra pass next to the full one (merged by the plots):
+
+```bash
+export XHI_METRICS=cylindrical,gallery TB_METRICS=cylindrical,gallery
+export EXTRA="--set omega_m=0.308 --set cyl_native_cell_mpc=2.296875 --set cyl_native_los_dz=0.0065146580 --set gallery_samples=100"
+MODELS=<m> OUT=runs/cm21eval/<m>/viz sbatch --export=ALL slurm/loreli_cm21eval.sbatch     # ~3 min per model
+PYTHONPATH=$HOME/21cmEVAL/src python -m cm21eval plot all --run runs/cm21eval \
+    --out docs/figures/loreli/cm21eval_viz/ref_vs_b8_pointwise --models reference,b8_pointwise \
+    --style docs/figures/loreli/src/cm21eval_style.json --title "LoReLi II v3 test"
+```
+
+(`sbatch --export=A=x,y` splits at the comma: export the metric lists in the shell and pass `--export=ALL`.)
 21cmEVAL pools nothing across the four redshift groups; the script concatenates per-cone curves over all
 groups (median, 16-84 %) and pools voxel RMSE exactly.
 
