@@ -1,12 +1,15 @@
 """Export LoReLi v3 test-lightcone predictions as fno-21cm ``eval_cubes`` (+ optional native cylindrical power).
 
     python scripts/loreli_export_eval_cubes.py --model b8_pointwise \
-        [--native-cyl runs/eval3d/native_cyl/loreli_v3_b8_pointwise] [--cyl-z 5.5 6 7 8 9]
+        [--native-cyl runs/eval3d/native_cyl/loreli_v3_b8_pointwise] [--cyl-z 5.5 6 7 8 9 | --cyl-stages 0.8 0.5 0.2]
 
 The LoReLi counterpart of ``ebm21cm.export_slicewise_mf`` / ``export_cubes3d``: it writes the cone
 files and manifests that the repository's viz tools read (``ebm21cm.compare_cones3d``,
 ``ebm21cm.delta_slices``, ``ebm21cm.tb_cyl_power``) and, with ``--native-cyl``, feeds
-``ebm21cm.native_cyl.NativeCyl`` exactly as those exporters do (for ``ebm21cm.plot_cyl_error``).
+``ebm21cm.native_cyl.NativeCyl`` exactly as those exporters do (for ``ebm21cm.plot_cyl_error``),
+at fixed redshifts or (``--cyl-stages``) at ionization stages, and with LoReLi's native
+resolution recorded (128 transverse cells, uniform-z LOS planes) so that the plot can mark the
+wavenumbers the interpolated truth does not resolve.
 Nothing is predicted here: the inputs are the 21cmEVAL pipeline's full test lightcones (truth in
 ``--truth-root/<group>/cone<N>.npz``, predictions in ``--preds/<model>/cone<N>.npz`` from
 ``scripts/loreli_cm21eval_predict.py``; interior 206 x 206 cells of 294 Mpc, LOS on the 1.4286 Mpc
@@ -43,6 +46,8 @@ def main(argv=None):
     ap.add_argument("--native-cyl", default=None, metavar="PREFIX",
                     help="also write native-resolution cylindrical x_HI/T_b power (ebm21cm.native_cyl) to PREFIX_<field>.npz")
     ap.add_argument("--cyl-z", type=float, nargs="+", default=[5.5, 6.0, 7.0, 8.0, 9.0])
+    ap.add_argument("--cyl-stages", type=float, nargs="+", default=None,
+                    help="centre the chunks per cone at these true slice-mean x_HI instead of --cyl-z")
     ap.add_argument("--cyl-only", action="store_true", help="only the native cylindrical power, no cubes")
     a = ap.parse_args(argv)
     tag = a.tag or f"loreli_v3_{a.model}"
@@ -51,8 +56,12 @@ def main(argv=None):
     prov = json.loads((a.preds / a.model / "provenance.json").read_text())
     cyl = None
     if a.native_cyl:
+        from ebm21cm.data.loreli import LORELI_L_PERP, LORELI_NATIVE, loreli_redshifts
         from ebm21cm.native_cyl import NativeCyl
-        cyl = NativeCyl(a.cyl_z, box_mpc=L_PERP, n_perp=N_PERP)
+        z_nat, d_nat = loreli_redshifts()
+        spacing = lambda zz: float(np.interp(zz, 0.5 * (z_nat[1:] + z_nat[:-1]), np.diff(d_nat)))
+        cyl = NativeCyl(None if a.cyl_stages else a.cyl_z, stages=a.cyl_stages, box_mpc=L_PERP, n_perp=N_PERP,
+                        kperp_max=np.pi / (LORELI_L_PERP / LORELI_NATIVE), los_spacing=spacing)
     if not a.cyl_only:
         out.mkdir(parents=True, exist_ok=True)
     for g, spec in groups.items():
@@ -75,8 +84,9 @@ def main(argv=None):
                          density=density.astype(np.float16), z_native=z)
                 entries.append({"npz": str(path), "cone_id": int(c), "row": row, "omega_m": 0.308, "group": g})
             if cyl is not None:
-                cyl.add("xhi", c, z, truth, pred)
-                cyl.add("tb", c, z, tb_truth, tb_pred)
+                history = (z, truth.astype(np.float64).mean((0, 1)))
+                cyl.add("xhi", c, z, truth, pred, history=history)
+                cyl.add("tb", c, z, tb_truth, tb_pred, history=history)
             print(f"[{g}] cone {c}", flush=True)
         if not a.cyl_only:
             (out / f"manifest_{g}.json").write_text(json.dumps({

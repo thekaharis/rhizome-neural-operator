@@ -248,6 +248,32 @@ def test_native_cyl_linear_kpar_rows_are_the_los_frequencies():
     assert pt.shape == (8, 15) and np.all(pt > 0)
 
 
+def test_native_cyl_stage_chunks_and_resolution(tmp_path):
+    import numpy as np
+
+    from ebm21cm.native_cyl import NativeCyl
+    from ebm21cm.plot_cyl_error import load
+
+    z = np.linspace(6, 10, 200)
+    xbar = np.clip((z - 6) / 4, 0, 1)                      # x_HI rises 0 -> 1 along the cone
+    nc = NativeCyl(stages=(0.5, 0.99, 2.0), n_cells=16, kperp_max=1.0, los_spacing=lambda zz: 2.0)
+    s_mid, s_edge, s_none = nc.chunk_slices(z, (z, xbar))
+    assert s_mid.stop - s_mid.start == 16 and abs(xbar[s_mid.start + 8] - 0.5) < 0.02
+    assert s_edge == slice(184, 200)                       # shifted inside the cone (centre x_HI ~0.98)
+    assert s_none is None                                  # stage never reached
+    with __import__("pytest").raises(ValueError):
+        nc.chunk_slices(z, None)
+    field = np.random.default_rng(2).normal(size=(140, 140, 200))
+    nc.add("xhi", 1, z, field, field, history=(z, xbar))
+    nc.add("tb", 1, z, field, field, history=(z, xbar))
+    path = nc.save(tmp_path / "m", "m")[0]
+    _, res = load(f"{path}:m")
+    assert np.allclose(res["cyl_stage"], (0.5, 0.99, 2.0)) and np.isnan(res["cyl_z_centers"][2])
+    assert abs(res["cyl_z_centers"][0] - z[s_mid.start + 8]) < 1e-9
+    assert np.allclose(res["cyl_kpar_max"][:2], np.pi / 2) and float(res["kperp_max"]) == 1.0
+    assert np.allclose(res["cyl_ratio_med"][0], 1.0) and np.all(np.isnan(res["cyl_ratio_med"][2]))
+
+
 def test_periodic_upsample_is_exact_for_constants_and_wraps():
     from ebm21cm.model.rhizome import periodic_upsample
 

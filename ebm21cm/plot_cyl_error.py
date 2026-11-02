@@ -16,6 +16,12 @@ visibly tinted level and saturates at +-``--vmax`` (red: too much power). Grey: 
 truth power. Log wavenumber axes; bins with no Fourier modes in any model (e.g. a log k_par
 bin between two LOS harmonics) are merged into the next larger bin, so every cell is a
 logarithmic bin with data.
+
+Results from ``ebm21cm.native_cyl`` may carry two optional extras. Stage chunks
+(``cyl_stage``): columns are ionization stages, titled with the stage, the median chunk
+redshift and the number of cones. Native resolution (``kperp_max``, ``cyl_kpar_max``, when the
+truth was interpolated from a coarser grid): wavenumbers beyond it are hatched behind dashed
+lines, and cells whose centre lies there are left out of the "within" share.
 """
 
 from __future__ import annotations
@@ -68,8 +74,10 @@ def load(spec):
     with np.load(path, allow_pickle=True) as d:
         if f"{name}/cyl_ratio_med" not in d.files:
             raise SystemExit(f"{suite}: no cylindrical results for {name}")
-        return label or name, {k: d[f"{name}/{k}"] for k in ("cyl_ratio_med", "cyl_z_centers", "k_edges",
-                                                                "cyl_kpar_edges")}
+        res = {k: d[f"{name}/{k}"] for k in ("cyl_ratio_med", "cyl_z_centers", "k_edges", "cyl_kpar_edges")}
+        res.update({k: d[f"{name}/{k}"] for k in ("cyl_stage", "n_cones", "kperp_max", "cyl_kpar_max")
+                    if f"{name}/{k}" in d.files})
+        return label or name, res
 
 
 def main(argv=None):
@@ -89,12 +97,17 @@ def main(argv=None):
     models = [load(s) for s in a.model]
     ref = models[0][1]
     for label, res in models[1:]:
-        for k in ("cyl_z_centers", "k_edges", "cyl_kpar_edges"):
-            if not np.allclose(res[k], ref[k]):
+        for k in ("cyl_z_centers", "k_edges", "cyl_kpar_edges", "cyl_stage"):
+            if (k in res) != (k in ref) or (k in ref and not np.allclose(res[k], ref[k], equal_nan=True)):
                 raise SystemExit(f"{label}: {k} differs from {models[0][0]}")
     cmap = dead_band_cmap(a.vmax, a.dead)
     a.out.mkdir(parents=True, exist_ok=True)
     zc, kperp = ref["cyl_z_centers"], ref["k_edges"]
+    stage = ref.get("cyl_stage")
+    kperp_max = float(ref["kperp_max"]) if "kperp_max" in ref else np.inf
+    kpar_max = ref.get("cyl_kpar_max", np.full(len(zc), np.inf))
+    limited = np.isfinite(kperp_max) or np.isfinite(kpar_max).any()
+    col_name = (lambda c: f"z≈{round(zc[c], 1):g}") if stage is None else (lambda c: f"x̄≈{stage[c]:g}")
     summary = {}
     fig, axes = plt.subplots(len(models), len(zc), figsize=(4.4 * len(zc), 3.5 * len(models)), squeeze=False,
                              constrained_layout=True)
@@ -108,9 +121,21 @@ def main(argv=None):
             pcm = ax.pcolormesh(kp, kpar, err, cmap=cmap, vmin=-a.vmax, vmax=a.vmax)
             ax.set_xscale("log")
             ax.set_yscale("log")
-            inside = float(np.mean(np.abs(err.compressed()) <= a.dead))
+            kp_c, kpar_c = np.sqrt(kp[1:] * kp[:-1]), np.sqrt(kpar[1:] * kpar[:-1])
+            resolved = (kp_c[None, :] <= kperp_max) & (kpar_c[:, None] <= kpar_max[col])
+            for lim, span, line, top in ((kperp_max, ax.axvspan, ax.axvline, kp[-1]),
+                                         (kpar_max[col], ax.axhspan, ax.axhline, kpar[-1])):
+                if np.isfinite(lim) and lim < top:
+                    span(lim, top, facecolor="none", edgecolor="0.35", hatch="////", linewidth=0)
+                    line(lim, color="0.25", linestyle="--", linewidth=0.8)
+            vals = np.ma.masked_where(~resolved, err).compressed()
+            inside = float(np.mean(np.abs(vals) <= a.dead)) if vals.size else float("nan")
             summary.setdefault(label, [None] * len(zc))[col] = inside
-            ax.set_title(f"z ≈ {round(z, 1):g}: {100 * inside:.0f}% of cells within ±{a.dead:g}", fontsize=10)
+            cells = "resolved cells" if limited else "cells"
+            where = f"z ≈ {round(z, 1):g}" if stage is None else \
+                (r"$\bar{x}_{\rm HI}$" + f" ≈ {stage[col]:g} (z ≈ {z:.1f}, {int(res['n_cones'][col])} cones)"
+                 if "n_cones" in res else r"$\bar{x}_{\rm HI}$" + f" ≈ {stage[col]:g} (z ≈ {z:.1f})")
+            ax.set_title(f"{where}: {100 * inside:.0f}% of {cells} within ±{a.dead:g}", fontsize=10)
             if row == len(models) - 1:
                 ax.set_xlabel(r"$k_\perp$  [Mpc$^{-1}$]")
             if col == 0:
@@ -119,14 +144,19 @@ def main(argv=None):
     bar.set_label(r"$P_{\rm pred}/P_{\rm true} - 1$  (white: within $\pm$" + f"{a.dead:g})")
     ticks = sorted({-a.vmax, -a.dead, 0.0, a.dead, a.vmax} | set(np.round(np.arange(-a.vmax, a.vmax + 1e-9, 0.2), 2)))
     bar.set_ticks(ticks)
-    fig.suptitle(f"Cylindrical {a.field} power error, cone median over {a.cones}")
+    title = f"Cylindrical {a.field} power error, cone median over {a.cones}"
+    if stage is not None:
+        title += "; chunks centred per cone at the ionization stage"
+    if limited:
+        title += "\nhatched: beyond the truth's native resolution (not counted)"
+    fig.suptitle(title)
     path = a.out / f"{a.prefix}.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(path)
     for label, fr in summary.items():
         print(f"{label:28s} share of (k_perp, k_par) cells within ±{a.dead:g}: "
-              + " ".join(f"z≈{round(z, 1):g} {100 * f:.0f}%" for z, f in zip(zc, fr)))
+              + " ".join(f"{col_name(c)} {100 * f:.0f}%" for c, f in enumerate(fr)))
 
 
 if __name__ == "__main__":

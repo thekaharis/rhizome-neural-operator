@@ -135,6 +135,9 @@ def main(argv=None):
     ap.add_argument("--native-cyl", default=None, metavar="PREFIX",
                     help="also write native-resolution cylindrical x_HI/T_b power (ebm21cm.native_cyl) to PREFIX_<field>.npz")
     ap.add_argument("--cyl-z", type=float, nargs="+", default=[7.0, 9.0, 11.0, 14.0, 17.0])
+    ap.add_argument("--cyl-stages", type=float, nargs="+", default=None,
+                    help="centre the native-cyl chunks per cone at these true slice-mean x_HI (history from the "
+                         "reference cubes) instead of --cyl-z")
     ap.add_argument("--cyl-only", action="store_true", help="only the native cylindrical power, no cubes")
     args = ap.parse_args(argv)
 
@@ -228,7 +231,7 @@ def main(argv=None):
     cyl = None
     if args.native_cyl:
         from .native_cyl import NativeCyl
-        cyl = NativeCyl(args.cyl_z)
+        cyl = NativeCyl(None if args.cyl_stages else args.cyl_z, stages=args.cyl_stages)
     for k, entry in enumerate(entries):
         sid = int(entry["cone_id"])
         row = int(entry["row"])
@@ -236,9 +239,18 @@ def main(argv=None):
             raise ValueError(f"cone {sid}: reference row {row} is not this sample's test row")
         if cyl is not None:
             zn = np.asarray(dataset.redshifts[row])
-            c_xhi, c_tb, c_txhi, c_ttb = run(row, cyl.needed(zn))
-            cyl.add("xhi", sid, zn, np.moveaxis(c_txhi, 0, -1), c_xhi)
-            cyl.add("tb", sid, zn, np.moveaxis(c_ttb, 0, -1) * tb_scale + tb_off, c_tb)
+            history = None
+            if args.cyl_stages:
+                with np.load(entry["npz"]) as d:
+                    history = (d["z_native"], d["truth"].astype(np.float64).mean((0, 1)))
+            need = cyl.needed(zn, history)
+            if need.size:
+                c_xhi, c_tb, c_txhi, c_ttb = run(row, need)
+            else:  # no chunk of this cone qualifies (stage never reached)
+                c_xhi = c_tb = np.zeros((1, 1, 0))
+                c_txhi = c_ttb = np.zeros((0, 1, 1))
+            cyl.add("xhi", sid, zn, np.moveaxis(c_txhi, 0, -1), c_xhi, history=history)
+            cyl.add("tb", sid, zn, np.moveaxis(c_ttb, 0, -1) * tb_scale + tb_off, c_tb, history=history)
             if args.cyl_only:
                 print(f"[{k + 1}/{len(entries)}] sample {sid}: native cylindrical power", flush=True)
                 continue
