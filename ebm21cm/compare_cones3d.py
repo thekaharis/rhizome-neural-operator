@@ -1,4 +1,4 @@
-"""Per-cone comparison of 3-D x_HI predictions from several models, on identical planes.
+"""Per-cone comparison of 3-D x_HI (and T_b) predictions from several models, on identical planes.
 
     python -m ebm21cm.compare_cones3d --cone 24 \\
         --model "Rhizome w48=$EXPORT/rhizome3d_w48/native" \\
@@ -9,15 +9,20 @@
 A model source is a directory of native-resolution ``cone_<id>.h5`` files
 (``target``/``prediction`` groups, ``target_z``; ``export_cubes3d`` or
 fno-21cm's prediction export) or an ``eval_cubes`` ``manifest.json``
-(``pred``/``truth`` on native planes nearest a common redshift grid). All
-models are compared on the same native planes: those of the first manifest
-source if any, otherwise the native planes nearest a 512-point grid. Truth
-must agree across sources on those planes (checked).
+(``pred``/``truth`` and optionally ``tb_pred``/``tb_truth`` on native planes
+nearest a common redshift grid). All models are compared on the same native
+planes: those of the first manifest source if any, otherwise the native planes
+nearest a 512-point grid. Truth must agree across sources on those planes
+(checked).
 
-One page per cone, in fno-21cm's colours: lightcone strips (x vs z at the
-middle y row) over the active reionization band for truth and each model,
-signed-error strips, transverse slices at four ionization stages, and global
-x_HI(z). RMSEs are printed per model over all planes and over the active band.
+One gallery page per cone (``cone_<id>.png`` + ``.pdf``): a row per ionization
+stage (slice-mean x_HI 0.8 / 0.6 / 0.4 / 0.2, as far as the cone covers them),
+columns x_HI truth, each model, each model - truth, then the same for T_b when
+every source provides it. x_HI in viridis on [0, 1], T_b in magma on the
+truth's 1-99.5 % range per row, residuals in RdBu_r (x_HI +-1, T_b symmetric
+99 % of the largest model residual per row); the slice RMSE of each model panel
+is printed in its corner. RMSEs over all planes and over the active band go to
+``rmse.json``.
 """
 
 from __future__ import annotations
@@ -33,9 +38,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
+FIELDS = ("xhi", "tb")
+
 
 def load(source, cone):
-    """(truth, prediction, z) with the LOS last, in increasing redshift."""
+    """``{"xhi": (truth, pred), "tb": (truth, pred) or absent, "z": z}``, LOS last, increasing redshift."""
     source = Path(source)
     if source.suffix == ".json":
         spec = json.loads(source.read_text())
@@ -44,95 +51,88 @@ def load(source, cone):
         if entry is None:
             return None
         with np.load(entry["npz"]) as data:
-            return data["truth"].astype(np.float32), data["pred"].astype(np.float32), data["z_native"]
+            out = {"xhi": (data["truth"].astype(np.float32), data["pred"].astype(np.float32)),
+                   "z": data["z_native"]}
+            if "tb_pred" in data.files and "tb_truth" in data.files:
+                out["tb"] = (data["tb_truth"].astype(np.float32), data["tb_pred"].astype(np.float32))
+            return out
     path = source / f"cone_{cone}.h5"
     if not path.exists():
         return None
     with h5py.File(path, "r") as f:
-        return (f["target/neutral_fraction"][:].astype(np.float32),
-                f["prediction/neutral_fraction"][:].astype(np.float32), f["target_z"][:])
+        out = {"xhi": (f["target/neutral_fraction"][:].astype(np.float32),
+                       f["prediction/neutral_fraction"][:].astype(np.float32)), "z": f["target_z"][:]}
+        if "brightness_temp" in f["target"] and "brightness_temp" in f["prediction"]:
+            out["tb"] = (f["target/brightness_temp"][:].astype(np.float32),
+                         f["prediction/brightness_temp"][:].astype(np.float32))
+        return out
 
 
 def align(fields, z_common):
-    """Planes of a (truth, pred, z) triple at the native redshifts ``z_common``."""
-    truth, pred, z = fields
+    """The loaded fields restricted to the planes at the native redshifts ``z_common``."""
+    z = fields["z"]
     idx = np.abs(z[None, :] - z_common[:, None]).argmin(axis=1)
     if np.abs(z[idx] - z_common).max() > 1e-6:
         raise ValueError("a source lacks some of the common native planes")
-    return truth[..., idx], pred[..., idx]
+    return {k: (v[0][..., idx], v[1][..., idx]) for k, v in fields.items() if k != "z"}
 
 
-def page(cone, truth, preds, z, out, y_row=None):
+def stage_planes(means):
+    levels = [lv for lv in (0.8, 0.6, 0.4, 0.2) if means.min() < lv < means.max()] or [float(np.median(means))]
+    return [int(np.abs(means - lv).argmin()) for lv in levels]
+
+
+def page(cone, truth, preds, z, out):
+    """Gallery page; ``truth[field]`` cube, ``preds[name][field]`` cubes (field in ``truth``)."""
     names = list(preds)
-    means = truth.mean((0, 1))
-    active = np.flatnonzero((means > 0.02) & (means < 0.98))
-    lo, hi = (active.min(), active.max()) if len(active) else (0, len(z) - 1)
-    pad = max(4, (hi - lo) // 10)
-    band = slice(max(0, lo - pad), min(len(z), hi + pad + 1))
-    y = truth.shape[1] // 2 if y_row is None else y_row
-    levels = [lv for lv in (0.2, 0.4, 0.6, 0.8) if means.min() < lv < means.max()] or [float(np.median(means))]
-    planes = [int(np.abs(means - lv).argmin()) for lv in levels]
-
-    rows = len(names) + 1
-    fig = plt.figure(figsize=(18, 1.7 * rows + 3.0 * len(planes) + 0.8), constrained_layout=True)
-    grid = fig.add_gridspec(2, 1, height_ratios=[1.7 * rows, 3.0 * len(planes)])
-    strips = grid[0].subgridspec(rows, 2, width_ratios=[1, 1])
-    zb = z[band]
-    extent = (zb[0], zb[-1], 0, truth.shape[0])
-    image = err_image = None
-    limit = max(0.05, float(np.quantile(np.abs(np.concatenate(
-        [(p - truth)[:, y, band].ravel() for p in preds.values()])), 0.99)))
-    for r, (name, field) in enumerate([("Truth", truth)] + list(preds.items())):
-        ax = fig.add_subplot(strips[r, 0])
-        image = ax.imshow(field[:, y, band], origin="lower", aspect="auto", extent=extent,
-                          cmap="viridis", vmin=0, vmax=1, interpolation="nearest")
-        rmse = "" if name == "Truth" else (f"  RMSE all {np.sqrt(np.mean((field - truth) ** 2)):.4f}, "
-                                           f"band {np.sqrt(np.mean((field - truth)[..., band] ** 2)):.4f}")
-        ax.set_ylabel(name, fontsize=9)
-        ax.set_title(f"{name}{rmse}", fontsize=9, loc="left")
-        if r < rows - 1:
-            ax.set_xticklabels([])
-        else:
-            ax.set_xlabel("redshift")
-        ax_e = fig.add_subplot(strips[r, 1])
-        if name == "Truth":
-            ax_e.plot(z, means, color="black", label="truth")
-            for (n, p), c in zip(preds.items(), ("#264653", "#e07a5f", "#168aad", "#7b2cbf")):
-                ax_e.plot(z, p.mean((0, 1)), color=c, label=n, lw=1.2)
-            ax_e.axvspan(zb[0], zb[-1], color="0.9", zorder=0)
-            ax_e.set_ylabel(r"global $x_{HI}$")
-            ax_e.legend(fontsize=7)
-            ax_e.set_xlim(z[0], z[-1])
-            ax_e.set_title("global history (grey: strip band)", fontsize=9, loc="left")
-        else:
-            err_image = ax_e.imshow((field - truth)[:, y, band], origin="lower", aspect="auto", extent=extent,
-                                    cmap="RdBu_r", vmin=-limit, vmax=limit, interpolation="nearest")
-            ax_e.set_title(f"{name}: prediction - truth", fontsize=9, loc="left")
-            if r < rows - 1:
-                ax_e.set_xticklabels([])
-            else:
-                ax_e.set_xlabel("redshift")
-    fig.colorbar(image, ax=fig.axes[0], shrink=0.8, label="$x_{HI}$")
-    fig.colorbar(err_image, ax=fig.axes[-1], shrink=0.8, label="signed error")
-
-    slices = grid[1].subgridspec(len(planes), rows)
+    fields = [f for f in FIELDS if f in truth]
+    means = truth["xhi"].mean((0, 1))
+    planes = stage_planes(means)
+    n_m = len(names)
+    per = 1 + 2 * n_m
+    fig, ax = plt.subplots(len(planes), per * len(fields), figsize=(2.1 * per * len(fields) + 0.6, 2.75 * len(planes)),
+                           constrained_layout=True, squeeze=False)
+    label = {"xhi": "x$_{HI}$", "tb": "T$_b$"}
     for i, k in enumerate(planes):
-        for j, (name, field) in enumerate([("Truth", truth)] + list(preds.items())):
-            ax = fig.add_subplot(slices[i, j])
-            ax.imshow(field[:, :, k], origin="lower", cmap="viridis", vmin=0, vmax=1, interpolation="nearest")
-            ax.set_xticks([])
-            ax.set_yticks([])
-            if i == 0:
-                ax.set_title(name, fontsize=10)
-            if j == 0:
-                ax.set_ylabel(f"z={z[k]:.2f}\nmean {means[k]:.2f}", fontsize=9)
+        for b, f in enumerate(fields):
+            tr = truth[f][:, :, k]
+            ps = [preds[n][f][:, :, k] for n in names]
+            if f == "xhi":
+                cm, v0, v1, dl = "viridis", 0.0, 1.0, 1.0
             else:
-                rmse = np.sqrt(np.mean((field[:, :, k] - truth[:, :, k]) ** 2))
-                ax.text(0.02, 0.98, f"RMSE={rmse:.3f}", transform=ax.transAxes, va="top", ha="left",
-                        fontsize=8, color="white", bbox={"facecolor": "black", "alpha": 0.55, "pad": 2})
-    fig.suptitle(f"Test cone {cone}: lightcone strips at y={y}, transverse slices at four stages", fontsize=13)
-    fig.savefig(out, dpi=130)
+                cm = "magma"
+                v0, v1 = np.percentile(tr, [1, 99.5])
+                dl = max(float(np.percentile(np.abs(p - tr), 99)) for p in ps) or 1.0
+            unit = "" if f == "xhi" else " [mK]"
+            panels = [(f"{label[f]} truth{unit}", tr, cm, v0, v1, None)]
+            panels += [(f"{label[f]} {n}", p, cm, v0, v1, p - tr) for n, p in zip(names, ps)]
+            panels += [(f"{label[f]} {n}\n− truth{unit}", p - tr, "RdBu_r", -dl, dl, None) for n, p in zip(names, ps)]
+            for j, (title, img, c, lo, hi, err) in enumerate(panels):
+                a = ax[i, b * per + j]
+                im = a.imshow(img, cmap=c, vmin=lo, vmax=hi, origin="lower", interpolation="nearest")
+                a.set_xticks([])
+                a.set_yticks([])
+                if i == 0:
+                    a.set_title(title, fontsize=9)
+                if err is not None:
+                    e = float(np.sqrt(np.mean(err ** 2)))
+                    a.text(0.02, 0.97, f"{e:.3f}" if f == "xhi" else f"{e:.1f} mK", transform=a.transAxes, va="top",
+                           fontsize=8, color="w", bbox=dict(facecolor="k", alpha=0.55, lw=0))
+                if j in (n_m, per - 1):
+                    fig.colorbar(im, ax=a, shrink=0.8)
+        ax[i, 0].set_ylabel(f"cone {cone}\nz = {z[k]:.2f}, <x$_{{HI}}$> = {means[k]:.2f}", fontsize=9)
+    fig.suptitle(f"Test cone {cone}: transverse slices at four ionization stages; numbers are slice RMSE. "
+                 f"{truth['xhi'].shape[0]}×{truth['xhi'].shape[1]} cells.", fontsize=10)
+    for ext in ("png", "pdf"):
+        fig.savefig(Path(out).with_suffix(f".{ext}"), dpi=170 if ext == "png" else None)
     plt.close(fig)
+
+
+def active_band(means):
+    active = np.flatnonzero((means > 0.02) & (means < 0.98))
+    lo, hi = (active.min(), active.max()) if len(active) else (0, len(means) - 1)
+    pad = max(4, (hi - lo) // 10)
+    return slice(max(0, lo - pad), min(len(means), hi + pad + 1))
 
 
 def main(argv=None):
@@ -153,24 +153,29 @@ def main(argv=None):
             continue
         manifests = [n for n, src in sources if src.endswith(".json")]
         if manifests:
-            z_common = loaded[manifests[0]][2]
+            z_common = loaded[manifests[0]]["z"]
         else:
-            z = next(iter(loaded.values()))[2]
+            z = next(iter(loaded.values()))["z"]
             grid = np.linspace(max(z[0], 5.001), min(z[-1], 24.97), args.n_z)
             z_common = z[np.unique(np.abs(z[None, :] - grid[:, None]).argmin(axis=1))]
         aligned = {n: align(v, z_common) for n, v in loaded.items()}
-        truth = next(iter(aligned.values()))[0]
-        for n, (t, _) in aligned.items():
-            if not np.allclose(t, truth, atol=1e-6):
+        fields = [f for f in FIELDS if all(f in v for v in aligned.values())]
+        first = next(iter(aligned.values()))
+        truth = {f: first[f][0] for f in fields}
+        for n, v in aligned.items():
+            if not np.allclose(v["xhi"][0], truth["xhi"], atol=1e-6):
                 raise ValueError(f"cone {cone}: truth of {n} differs from the other sources")
-        preds = {n: p for n, (_, p) in aligned.items()}
+        preds = {n: {f: v[f][1] for f in fields} for n, v in aligned.items()}
         out = args.out / f"cone_{cone}.png"
         page(cone, truth, preds, z_common, out)
+        band = active_band(truth["xhi"].mean((0, 1)))
         row = {"cone": cone, "planes": len(z_common),
-               **{n: float(np.sqrt(np.mean((p - truth) ** 2))) for n, p in preds.items()}}
+               **{n: float(np.sqrt(np.mean((p["xhi"] - truth["xhi"]) ** 2))) for n, p in preds.items()},
+               "band": {n: float(np.sqrt(np.mean((p["xhi"] - truth["xhi"])[..., band] ** 2))) for n, p in preds.items()}}
+        if "tb" in fields:
+            row["tb_mK"] = {n: float(np.sqrt(np.mean((p["tb"] - truth["tb"]) ** 2))) for n, p in preds.items()}
         table.append(row)
-        print(f"cone {cone}: " + "  ".join(f"{n} {v:.4f}" for n, v in row.items() if n not in ("cone", "planes"))
-              + f"  -> {out}")
+        print(f"cone {cone}: " + "  ".join(f"{n} {row[n]:.4f}" for n in preds) + f"  -> {out}")
     (args.out / "rmse.json").write_text(json.dumps(table, indent=2))
 
 
