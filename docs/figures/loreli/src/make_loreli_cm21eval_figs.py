@@ -1,6 +1,7 @@
 """Comparative figures from the 21cmEVAL runs on the LoReLi II v3 test lightcones.
 
     python docs/figures/loreli/src/make_loreli_cm21eval_figs.py [runs/cm21eval] [docs/figures/loreli/cm21eval]
+        [--models reference b8_pointwise]
 
 Reads <root>/<model>/<group>/{xhi,tb}/{curves.npz,summary.csv} for every model present and
 <root>/groups.json, and writes PDF + PNG figures.  The test cones are split into geometry
@@ -10,10 +11,10 @@ RMSE is pooled exactly (voxel-count weighted MSE), front profiles are count-weig
 Models that are missing (e.g. 44-block arms still training) are skipped, so the script can be
 rerun as results arrive.
 """
+import argparse
 import csv
 import json
 import math
-import sys
 from pathlib import Path
 
 import matplotlib
@@ -23,8 +24,12 @@ import matplotlib.ticker
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[4]
-ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 else REPO / "runs/cm21eval"
-OUT = Path(sys.argv[2]) if len(sys.argv) > 2 else REPO / "docs/figures/loreli/cm21eval"
+_ap = argparse.ArgumentParser()
+_ap.add_argument("root", nargs="?", type=Path, default=REPO / "runs/cm21eval")
+_ap.add_argument("out", nargs="?", type=Path, default=REPO / "docs/figures/loreli/cm21eval")
+_ap.add_argument("--models", nargs="+", default=None, help="restrict to these models (default: all complete ones)")
+_args = _ap.parse_args()
+ROOT, OUT = _args.root, _args.out
 OUT.mkdir(parents=True, exist_ok=True)
 
 STYLE = {  # name: (label, color, linestyle)
@@ -49,8 +54,11 @@ plt.rcParams.update({"font.size": 8.5, "axes.titlesize": 9, "legend.fontsize": 7
 
 groups = json.loads((ROOT / "groups.json").read_text())
 GROUPS = list(groups)
-models = [m for m in STYLE if all((ROOT / m / g / "xhi" / "curves.npz").exists() for g in GROUPS)]
-partial = [m for m in STYLE if m not in models and (ROOT / m).is_dir()]
+if _args.models and set(_args.models) - set(STYLE):
+    raise SystemExit(f"unknown models {sorted(set(_args.models) - set(STYLE))}; known: {list(STYLE)}")
+wanted = [m for m in STYLE if not _args.models or m in _args.models]
+models = [m for m in wanted if all((ROOT / m / g / "xhi" / "curves.npz").exists() for g in GROUPS)]
+partial = [m for m in wanted if m not in models and (ROOT / m).is_dir()]
 if not models:
     raise SystemExit(f"no complete 21cmEVAL results under {ROOT}")
 print("models:", models, "| incomplete (skipped):", partial)

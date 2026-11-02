@@ -29,6 +29,7 @@ compute node (`srun -p compute -c 8 --mem=80G`).
 | `eval3d/native_cyl/loreli_v3_*_cyl_error_{xhi,tb}` | Cylindrical power error P_pred/P_true - 1 (white within +-0.1), native LOS resolution, cone median, rows = models: `ebm21cm.plot_cyl_error` on `ebm21cm.native_cyl` output, the same tool and parameters as the 21cmFAST maps in `runs/eval3d/native_cyl/` | `data/eval_cubes/loreli_v3_<model>` |
 | `eval3d/loreli_cones/cone_<id>` | Gallery per cone: rows = stages (x_HI-bar 0.8/0.6/0.4/0.2); x_HI (viridis) and T_b (magma) truth, models, model - truth, slice RMSE per panel: `ebm21cm.compare_cones3d` | `data/eval_cubes/loreli_v3_<model>` |
 | `eval3d/loreli_deltas/<group>/cone_<id>_deltas`, `overview_deltas` | Prediction - truth per slice at x_HI-bar 0.2/0.4/0.6/0.8: `ebm21cm.delta_slices` | `data/eval_cubes/loreli_v3_<model>` |
+| `cm21eval_ref_vs_b8_pointwise/cm21_*` | The same eight 21cmEVAL figures restricted to the reference and the 8-block pointwise arm (`--models reference b8_pointwise`) | `runs/cm21eval` |
 | `cm21eval/cm21_eft_morphology` | EFT transfer / stochasticity / r(k) relative to truth (k <= 0.5); 3-D IoU vs ionized fraction; region counts and radii | `runs/cm21eval` |
 
 Figures marked **v2** document the state before the LOS-axis fix (wrong per-row redshifts,
