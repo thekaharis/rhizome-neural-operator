@@ -135,7 +135,8 @@ def main(argv=None):
             where = f"z ≈ {round(z, 1):g}" if stage is None else \
                 (r"$\bar{x}_{\rm HI}$" + f" ≈ {stage[col]:g} (z ≈ {z:.1f}, {int(res['n_cones'][col])} cones)"
                  if "n_cones" in res else r"$\bar{x}_{\rm HI}$" + f" ≈ {stage[col]:g} (z ≈ {z:.1f})")
-            ax.set_title(f"{where}: {100 * inside:.0f}% of {cells} within ±{a.dead:g}", fontsize=10)
+            ax.set_title(f"{where}: {100 * inside:.0f}% of {cells} within ±{a.dead:g}" if stage is None else
+                         f"{where}\n{100 * inside:.0f}% of {cells} within ±{a.dead:g}", fontsize=10)
             if row == len(models) - 1:
                 ax.set_xlabel(r"$k_\perp$  [Mpc$^{-1}$]")
             if col == 0:
