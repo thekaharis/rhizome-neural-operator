@@ -1,0 +1,15 @@
+{
+ "reference": {"label": "reference (zero-shot)", "color": "0.15", "ls": "--"},
+ "reference_oracle": {"label": "reference, oracle hist.", "color": "0.55", "ls": ":"},
+ "b8_decoder": {"label": "8 blk: decoder", "color": "#9ecae1", "ls": "-"},
+ "b8_ends": {"label": "8 blk: ends", "color": "#6baed6", "ls": "-"},
+ "b8_pointwise": {"label": "8 blk: pointwise", "color": "#3182bd", "ls": "-"},
+ "b8_none": {"label": "8 blk: none", "color": "#08519c", "ls": "-"},
+ "b8_scratch": {"label": "8 blk: scratch", "color": "#08306b", "ls": "-."},
+ "b44_decoder": {"label": "44 blk: decoder", "color": "#fcae91", "ls": "-"},
+ "b44_ends": {"label": "44 blk: ends", "color": "#fb6a4a", "ls": "-"},
+ "b44_pointwise": {"label": "44 blk: pointwise", "color": "#de2d26", "ls": "-"},
+ "b44_none": {"label": "44 blk: none", "color": "#a50f15", "ls": "-"},
+ "b44_scratch": {"label": "44 blk: scratch", "color": "#67000d", "ls": "-."},
+ "b44_none_oracle": {"label": "44 blk: none, oracle hist.", "color": "#a50f15", "ls": ":"}
+}
