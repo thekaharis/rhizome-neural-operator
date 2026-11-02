@@ -27,6 +27,8 @@ compute node (`srun -p compute -c 8 --mem=80G`).
 | `cm21eval/cm21_history` | τ, z(0.5), duration pred vs truth per cone; history errors; one example history per group | `runs/cm21eval` |
 | `cm21eval/cm21_fronts` | Mean x_HI and RMSE vs distance to the true ionization front; 10-90 % front width per cone | `runs/cm21eval` |
 | `eval3d/native_cyl/loreli_v3_*_cyl_error_{xhi,tb}` | Cylindrical power error P_pred/P_true - 1 (white within +-0.1), native LOS resolution, cone median, rows = models: `ebm21cm.plot_cyl_error` on `ebm21cm.native_cyl` output, the same tool and parameters as the 21cmFAST maps in `runs/eval3d/native_cyl/` | `data/eval_cubes/loreli_v3_<model>` |
+| `eval3d/native_cyl/loreli_v3_cyl_error_stage_{xhi,tb}` | The same error maps with chunks centred per cone at x_HI-bar 0.9/0.7/0.5/0.3/0.1 (`native_cyl` stage mode); hatched: beyond LoReLi's native resolution (2.3 Mpc transverse, 1.6-3.1 Mpc LOS), not counted | `runs/eval3d/native_cyl/stage/` |
+| `eval3d/native_cyl/native_cyl_error_stage_{xhi,tb}` | 21cmFAST baseline in the same stage layout: plain `rhizome_mf2d_w64_structured_all` (the LoReLi reference) and its `pw0.03_px0.03` power-loss variant, 199 test cones | `runs/eval3d/native_cyl/stage/` |
 | `eval3d/loreli_cones/cone_<id>` | Gallery per cone: rows = stages (x_HI-bar 0.8/0.6/0.4/0.2); x_HI (viridis) and T_b (magma) truth, models, model - truth, slice RMSE per panel: `ebm21cm.compare_cones3d` | `data/eval_cubes/loreli_v3_<model>` |
 | `eval3d/loreli_deltas/<group>/cone_<id>_deltas`, `overview_deltas` | Prediction - truth per slice at x_HI-bar 0.2/0.4/0.6/0.8: `ebm21cm.delta_slices` | `data/eval_cubes/loreli_v3_<model>` |
 | `cm21eval_ref_vs_b8_pointwise/cm21_*` | The same eight 21cmEVAL figures restricted to the reference and the 8-block pointwise arm (`--models reference b8_pointwise`) | `runs/cm21eval` |
@@ -60,6 +62,9 @@ runs/eval3d/native_cyl/loreli_v3_<m>`; one manifest per redshift group), then e.
 python -m ebm21cm.plot_cyl_error --out runs/eval3d/native_cyl --prefix loreli_v3_cyl_error_tb \
     --field '$T_b$ (native LOS resolution)' --cones '<n> LoReLi II test cones' \
     --model runs/eval3d/native_cyl/loreli_v3_reference_tb.npz:loreli_v3_reference=Reference ...
+# stage-matched chunks (LoReLi; 21cmFAST: export_slicewise_mf ... --cyl-only --cyl-stages ...)
+python scripts/loreli_export_eval_cubes.py --model <m> --cyl-only --cyl-stages 0.9 0.7 0.5 0.3 0.1 \
+    --native-cyl runs/eval3d/native_cyl/stage/loreli_v3_<m>
 python -m ebm21cm.compare_cones3d --cone 12316 --out runs/eval3d/loreli_cones \
     --model Reference=data/eval_cubes/loreli_v3_reference/manifest_G1_z5.0.json ...
 python -m ebm21cm.delta_slices --cone 12316 12317 --out runs/eval3d/loreli_deltas/G1_z5.0 \
