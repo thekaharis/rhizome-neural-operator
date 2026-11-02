@@ -26,9 +26,9 @@ compute node (`srun -p compute -c 8 --mem=80G`).
 | `cm21eval/cm21_bubbles` | Mean-free-path bubble-size distributions per stage, truth vs models | `runs/cm21eval` |
 | `cm21eval/cm21_history` | τ, z(0.5), duration pred vs truth per cone; history errors; one example history per group | `runs/cm21eval` |
 | `cm21eval/cm21_fronts` | Mean x_HI and RMSE vs distance to the true ionization front; 10-90 % front width per cone | `runs/cm21eval` |
-| `cm21eval/slices_{xhi,tb}` | Cones 12316 (G1) and 19547 (G4) at x_HI-bar 0.75 / 0.5 / 0.25: truth, reference, 8-block pointwise, model - truth, RMSE per panel | eval cubes + `runs/cm21eval/preds` |
-| `cm21eval/lightcone_<cone>` | Transverse-LOS cut through the whole group window: x_HI and T_b, truth vs models | eval cubes + preds |
-| `cm21eval/cyl_{xhi,tb}` | Cylindrical P(k_perp, k_par): truth Delta^2, P_model/P_truth and r per model in stage-matched 183 Mpc LOS chunks (x_HI-bar 0.8 / 0.5 / 0.2), median over cones; maps in `cyl_summary.json` | eval cubes + preds |
+| `eval3d/native_cyl/loreli_v3_*_cyl_error_{xhi,tb}` | Cylindrical power error P_pred/P_true - 1 (white within +-0.1), native LOS resolution, cone median, rows = models: `ebm21cm.plot_cyl_error` on `ebm21cm.native_cyl` output, the same tool and parameters as the 21cmFAST maps in `runs/eval3d/native_cyl/` | `data/eval_cubes/loreli_v3_<model>` |
+| `eval3d/loreli_cones/cone_<id>` | Lightcone strips, global history and transverse slices at four stages: `ebm21cm.compare_cones3d` | `data/eval_cubes/loreli_v3_<model>` |
+| `eval3d/loreli_deltas/<group>/cone_<id>_deltas`, `overview_deltas` | Prediction - truth per slice at x_HI-bar 0.2/0.4/0.6/0.8: `ebm21cm.delta_slices` | `data/eval_cubes/loreli_v3_<model>` |
 | `cm21eval/cm21_eft_morphology` | EFT transfer / stochasticity / r(k) relative to truth (k <= 0.5); 3-D IoU vs ionized fraction; region counts and radii | `runs/cm21eval` |
 
 Figures marked **v2** document the state before the LOS-axis fix (wrong per-row redshifts,
@@ -51,8 +51,19 @@ the ladders finish): `python docs/figures/loreli/src/make_loreli_cm21eval_figs.p
 21cmEVAL pools nothing across the four redshift groups; the script concatenates per-cone curves over all
 groups (median, 16-84 %) and pools voxel RMSE exactly.
 
-Slices and cylindrical spectra (CPU, ~15 min for 30 cones; any models with predictions):
-`python docs/figures/loreli/src/make_loreli_slices_cyl.py --models reference b8_pointwise`.
+`eval3d/` figures come from the repository's standard viz tools (rendered into `runs/eval3d/`, copied
+here). Export a model once (`scripts/loreli_export_eval_cubes.py --model <m> --native-cyl
+runs/eval3d/native_cyl/loreli_v3_<m>`; one manifest per redshift group), then e.g.
+
+```bash
+python -m ebm21cm.plot_cyl_error --out runs/eval3d/native_cyl --prefix loreli_v3_cyl_error_tb \
+    --field '$T_b$ (native LOS resolution)' --cones '<n> LoReLi II test cones' \
+    --model runs/eval3d/native_cyl/loreli_v3_reference_tb.npz:loreli_v3_reference=Reference ...
+python -m ebm21cm.compare_cones3d --cone 12316 --out runs/eval3d/loreli_cones \
+    --model Reference=data/eval_cubes/loreli_v3_reference/manifest_G1_z5.0.json ...
+python -m ebm21cm.delta_slices --cone 12316 12317 --out runs/eval3d/loreli_deltas/G1_z5.0 \
+    --model Reference=data/eval_cubes/loreli_v3_reference/manifest_G1_z5.0.json ...
+```
 
 The `decoder_b8_v3/` set: `python docs/figures/loreli/src/make_loreli_decoder_viz.py <run_dir> <out_dir> [--stride 3]`
 (GPU, ~6 min on an A30; writes `decoder_viz_data.npz`, then `--plot-only` re-plots on CPU). Works for any ladder run.

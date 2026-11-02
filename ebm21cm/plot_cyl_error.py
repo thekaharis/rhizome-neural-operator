@@ -80,6 +80,7 @@ def main(argv=None):
     ap.add_argument("--dead", type=float, default=0.1)
     ap.add_argument("--field", default=r"$x_{\rm HI}$", help="field name in the title")
     ap.add_argument("--prefix", default="ps_cyl_error", help="output file prefix")
+    ap.add_argument("--cones", default="199 test cones", help="cone set named in the title")
     a = ap.parse_args(argv)
     import matplotlib
     matplotlib.use("Agg")
@@ -109,7 +110,7 @@ def main(argv=None):
             ax.set_yscale("log")
             inside = float(np.mean(np.abs(err.compressed()) <= a.dead))
             summary.setdefault(label, [None] * len(zc))[col] = inside
-            ax.set_title(f"z ≈ {z:.0f}: {100 * inside:.0f}% of cells within ±{a.dead:g}", fontsize=10)
+            ax.set_title(f"z ≈ {round(z, 1):g}: {100 * inside:.0f}% of cells within ±{a.dead:g}", fontsize=10)
             if row == len(models) - 1:
                 ax.set_xlabel(r"$k_\perp$  [Mpc$^{-1}$]")
             if col == 0:
@@ -118,14 +119,14 @@ def main(argv=None):
     bar.set_label(r"$P_{\rm pred}/P_{\rm true} - 1$  (white: within $\pm$" + f"{a.dead:g})")
     ticks = sorted({-a.vmax, -a.dead, 0.0, a.dead, a.vmax} | set(np.round(np.arange(-a.vmax, a.vmax + 1e-9, 0.2), 2)))
     bar.set_ticks(ticks)
-    fig.suptitle(f"Cylindrical {a.field} power error, cone median over 199 test cones")
+    fig.suptitle(f"Cylindrical {a.field} power error, cone median over {a.cones}")
     path = a.out / f"{a.prefix}.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(path)
     for label, fr in summary.items():
         print(f"{label:28s} share of (k_perp, k_par) cells within ±{a.dead:g}: "
-              + " ".join(f"z≈{z:.0f} {100 * f:.0f}%" for z, f in zip(zc, fr)))
+              + " ".join(f"z≈{round(z, 1):g} {100 * f:.0f}%" for z, f in zip(zc, fr)))
 
 
 if __name__ == "__main__":

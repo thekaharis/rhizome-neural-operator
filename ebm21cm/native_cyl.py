@@ -10,6 +10,10 @@ bins (``KBinner``); k_par keeps every discrete LOS frequency as its own row (lin
 spacing, edges halfway between, as fno-21cm's ``build_chunks``), or with
 ``kpar_bins="log"`` the k_perp log bins.
 
+The transverse geometry defaults to the 21cmFAST test cones (200 Mpc, 140 cells); LoReLi
+lightcones pass ``box_mpc=294, n_perp=206`` (same 1.43 Mpc cells, so the same k_par rows; k_perp
+uses ``KBinner``'s 15 log bins of the larger box).
+
 Per chunk, as in fno-21cm's ``_cylindrical_sums``: per-slice mean removed, Hann
 window along the LOS (the chunk is not periodic), 3-D FFT, |F|^2 and Re(F_t F_p*)
 summed into (k_par, k_perp) bins; the k_par = 0 plane is excluded. Per cone: ratio
@@ -32,13 +36,15 @@ BOX_MPC, N_PERP, N_BINS, MIN_TRUTH_STD = 200.0, 140, 15, 1e-3
 
 
 class NativeCyl:
-    def __init__(self, z_centers, n_cells=140, fields=("xhi", "tb"), kpar_bins="linear"):
+    def __init__(self, z_centers, n_cells=140, fields=("xhi", "tb"), kpar_bins="linear", box_mpc=BOX_MPC,
+                 n_perp=N_PERP):
         sys.path.insert(0, FNO_ROOT)
         from viz.power_spectrum_evaluation import KBinner
 
         self.z_centers, self.n_cells, self.fields = tuple(z_centers), int(n_cells), tuple(fields)
-        self.binner = KBinner(N_PERP, N_PERP, BOX_MPC, N_BINS)
-        self.cell = BOX_MPC / N_PERP
+        self.box_mpc, self.n_perp = float(box_mpc), int(n_perp)
+        self.binner = KBinner(self.n_perp, self.n_perp, self.box_mpc, N_BINS)
+        self.cell = self.box_mpc / self.n_perp
         kpar = 2 * np.pi * np.fft.rfftfreq(self.n_cells, d=self.cell)
         if kpar_bins == "linear":  # one row per frequency, DC dropped
             self.kpar_matrix = np.eye(len(kpar))[:, 1:]
@@ -138,6 +144,7 @@ class NativeCyl:
                 f"{m}/truth_power": np.array([[np.nan if r is None else float(r[0].sum()) for r in rec]
                                               for rec in recs]),
                 f"{m}/meta": np.array(json.dumps({"n_cells": self.n_cells, "cell_mpc": self.cell, "field": field,
+                                                  "box_mpc": self.box_mpc, "n_perp": self.n_perp,
                                                   "kpar_rows": len(self.kpar_edges) - 1,
                                                   "resolution": "native LOS"}))})
             paths.append(path)
