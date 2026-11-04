@@ -20,7 +20,8 @@ def __getattr__(attr):
         raise AttributeError(attr)
     tag = attr[len("predict_"):]
     if not (EVAL_CUBES / tag).is_dir():
-        raise FileNotFoundError(f"no eval_cubes for {tag!r} under {EVAL_CUBES}")
+        # AttributeError, not FileNotFoundError: getattr(module, "predict_draws", None) probes must see "absent"
+        raise AttributeError(f"no eval_cubes for {tag!r} under {EVAL_CUBES}")
 
     def predict(sample):
         with np.load(EVAL_CUBES / tag / f"{sample.id}.npz") as d:
