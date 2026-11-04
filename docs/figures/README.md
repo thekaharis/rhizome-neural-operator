@@ -5,13 +5,15 @@
 | `rhizome_architecture.pdf` | Full model and one synchronous update | `rhizome_architecture.tex` (TikZ, standalone) |
 | `rhizome_mechanism.pdf` | Learned kernel, gates and gate re-weighting of a trained checkpoint | `scripts/make_rhizome_mechanism.py` |
 | `rhizome_network.pdf` | How cells exchange information: tree (U-Net), fixed global kernel, rhizome | `scripts/make_rhizome_network.py` |
+| `rhizome_network_horizontal.pdf` | The same three panels side by side (README) | `scripts/make_rhizome_network.py --layout horizontal` |
 
 PNG copies (300 dpi) are for slides; use the PDFs in LaTeX. The architecture
 and mechanism figures are sized for a full text width of about 7 in
 (`\textwidth` in a two-column layout, or `\linewidth` in a single-column
 thesis). The network figure stacks its three panels vertically at 3.4 × 9.3 in,
 one column wide; in a single-column thesis place it as a full-height figure or
-beside text with `wrapfigure`.
+beside text with `wrapfigure`. `rhizome_network_horizontal` puts the panels side by side at
+7.0 × 2.85 in, full text width.
 
 ## Rebuild
 
@@ -31,6 +33,7 @@ python scripts/make_rhizome_network.py \
   --checkpoint runs/rhizome_long_seed1/fit/best.pt \
   --cache runs/rhizome_long_seed1/slices.h5 \
   --out docs/figures/rhizome_network
+# side by side: --layout horizontal --out docs/figures/rhizome_network_horizontal
 ```
 
 The recorded figures used the long-run checkpoint (step 8,200) and cache from

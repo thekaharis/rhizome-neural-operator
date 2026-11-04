@@ -44,8 +44,6 @@ repeat T times with shared weights:                              # one synchrono
 x_HI = sigmoid(decode(h_T)),   T_b = x_HI · phys · (1 − exp(u))   # structured T_b head
 ```
 
-<img align="right" src="docs/readme/network.png" alt="How cells exchange information: (a) U-Net tree, (b) global fixed kernel, (c) rhizome with receiver and sender gates" width="270">
-
 - **One cross-cell operation.** The message m is the only operation that couples cells.
   - The kernel κ<sub>θ</sub> is parameterized by its Fourier coefficients and evaluated with an
     FFT, at O(N log N) with no N×N edge tensor.
@@ -53,7 +51,7 @@ x_HI = sigmoid(decode(h_T)),   T_b = x_HI · phys · (1 − exp(u))   # structur
 - **Gated connections.** A Fourier layer connects every cell to every other through one fixed
   pattern. In the rhizome, the edge j → i is scaled by the receiver's gate A<sub>i</sub> and the
   sender's gate B<sub>j</sub>. Both gates are recomputed from the state at each update, so the
-  effective connectivity changes as the field evolves (right: tree vs fixed global kernel vs
+  effective connectivity changes as the field evolves (below: tree vs fixed global kernel vs
   rhizome).
 - **Structured T<sub>b</sub> head.** The second output channel is a spin variable u, and
   T<sub>b</sub> = x<sub>HI</sub> · A(z)(1+δ) · (1 − e<sup>u</sup>). The physical factor
@@ -61,6 +59,10 @@ x_HI = sigmoid(decode(h_T)),   T_b = x_HI · phys · (1 − exp(u))   # structur
 - **Periodic transverse domain.** The FFT treats the transverse plane as periodic, which
   matches 21cmFAST boxes. For non-periodic data (LoReLi lightcones) the plane is mirror-padded
   and only the interior is scored.
+
+<p align="center">
+  <img src="docs/readme/network.png" alt="How cells exchange information: (a) U-Net tree, (b) global fixed kernel, (c) rhizome with receiver and sender gates" width="100%">
+</p>
 
 Below, the learned kernel and gates of a checkpoint trained on toy lightcones, on a validation slice. The ring
 is the receiver cell on an ionization front. Panels (e–h) show how the gates re-weight its
@@ -80,8 +82,6 @@ The same law exists in other forms:
 - with a compact real-space disc kernel (`radius=`);
 - with several gated pathways ([docs/rhizome_multipath.md](docs/rhizome_multipath.md)).
 
-<br clear="right">
-
 ## The 21cmFAST reference model
 
 `runs/rhizome_mf2d_w64_structured_all` is the slice-wise multi-field model that every LoReLi
@@ -97,7 +97,7 @@ experiment starts from.
 | architecture | width 64, 24 Fourier modes, 6 updates, Δt = 0.5; 18.5 M parameters |
 | data | 6,567 21cmFAST cones (fno-21cm's multi-field split and normalization), 16 stratified + 2 background slices per cone (104,718 rows), z ≈ 5–25 |
 | objective | BCE(x<sub>HI</sub>) + MSE(normalized T<sub>b</sub>); Adam, learning rate halved on validation plateaus, stop at the floor (84k steps) |
-| test | x<sub>HI</sub> RMSE 0.087, T<sub>b</sub> RMSE 7.7 mK, BCE 0.132 |
+| test (cache rows) | x<sub>HI</sub> RMSE 0.087, T<sub>b</sub> RMSE 7.7 mK, BCE 0.132 on the stratified test slices |
 
 Build the slice cache from fno-21cm's preparation, then train and export:
 
@@ -119,6 +119,37 @@ ARGS="--width 64 --batch-size 32 --head structured" \
 python -m ebm21cm.export_slicewise_mf --run runs/rhizome_mf2d_w64_structured_all \
     --reference $CUBES/rhizome3d_mf_C/manifest.json --tag rhizome2d_mf_w64_all --out-dir $CUBES
 ```
+
+A test cone as the model sees it (target x<sub>HI</sub>, T<sub>b</sub>, the central density and
+LOS-velocity bands, `phys`), at three stages and one background slice:
+
+<p align="center">
+  <img src="docs/readme/21cmfast_cache_slices.jpg" alt="21cmFAST test cone 24 at four slices: target x_HI, T_b, density band, LOS velocity band, physical factor" width="92%">
+</p>
+
+**Results** on the 199 test cones, full restacked cones on fno-21cm's 512-plane evaluation grid,
+scored with [21cmEVAL](https://github.com/thekaharis/21cmEVAL). The comparison is fno-21cm's 3-D
+multi-field model `mf_cnn_whno_es_tbs_histtb_tbclean_ep26` (CNN + Walsh–Hadamard local operator),
+which sees whole lightcone windows rather than one slice:
+
+| model | x<sub>HI</sub> RMSE | T<sub>b</sub> RMSE [mK] | IoU | r(k = 0.2 Mpc<sup>-1</sup>), x<sub>HI</sub> / T<sub>b</sub> | \|Δτ\| [σ<sub>Planck</sub>] |
+|---|---|---|---|---|---|
+| Rhizome, 2-D slice-wise | 0.031 | 3.96 | 0.942 | 0.986 / 0.987 | 0.010 |
+| fno-21cm, 3-D | 0.041 | 5.21 | 0.874 | 0.965 / 0.965 | 0.076 |
+
+- **Scoring:** RMSE is pooled over every plane of the cones, including the fully neutral and
+  fully ionized ones. That is why it is lower than the cache-row number above.
+- **Per-cone statistics:** IoU, coherence r and |Δτ| are medians over cones.
+- **Error figures:** both models lose small-scale power. The cylindrical T<sub>b</sub> power
+  error is within ±0.1 in 91 → 26 % of the resolved cells for the rhizome as the stage goes
+  from x̄<sub>HI</sub> 0.9 to 0.1, and in 64 → 1 % for the 3-D model.
+- **All figures:** [docs/figures/21cmfast/README.md](docs/figures/21cmfast/README.md).
+
+Test cone 24, truth vs the rhizome vs the fno-21cm 3-D model (x<sub>HI</sub> and T<sub>b</sub>, residuals, slice RMSE):
+
+<p align="center">
+  <img src="docs/readme/21cmfast_gallery_cone24.jpg" alt="Gallery of 21cmFAST test cone 24 at four ionization stages: x_HI and T_b truth, rhizome, fno-21cm 3-D model, residuals" width="100%">
+</p>
 
 ## Transfer to LoReLi II
 
@@ -231,6 +262,9 @@ planes, the pruned public set, 294 vs 300 Mpc and the missing RSD term. Every Lo
     T<sub>b</sub>, and stages T<sub>b</sub> by the true x<sub>HI</sub>.
 - **`ebm21cm.evaluate_loreli_finetune`** gives test-split metrics (BCE, RMSE, score per stage)
   for any ladder run or the remapped reference. It runs automatically after each ladder arm.
+- **21cmFAST test set:** `scripts/eval_cubes_cm21eval.py` chunks an `eval_cubes` export into
+  21cmEVAL manifests, `scripts/eval_cubes_adapter.py` serves any export's predictions, and
+  `slurm/cm21eval_eval_cubes.sbatch` scores one chunk per array task.
 - **Repository viz tools.** They read `eval_cubes` manifests, which
   `export_slicewise_mf` and `scripts/loreli_export_eval_cubes.py` produce:
   - `native_cyl` + `plot_cyl_error`: cylindrical power error P<sub>pred</sub>/P<sub>true</sub> − 1 at
@@ -311,7 +345,7 @@ The tests cover:
 | [rhizome_literature_review.md](docs/rhizome_literature_review.md) | positioning against prior work (AFT, Hyena/H3, FNO) |
 | [darcy_width8.md](docs/darcy_width8.md) | Darcy-flow test at hidden width 8 |
 | [recurrent_operator.md](docs/recurrent_operator.md) | the additive local + Fourier baseline |
-| [figures/README.md](docs/figures/README.md), [figures/loreli/README.md](docs/figures/loreli/README.md) | paper and LoReLi figures, captions, rebuild commands |
+| [figures/README.md](docs/figures/README.md), [figures/21cmfast/README.md](docs/figures/21cmfast/README.md), [figures/loreli/README.md](docs/figures/loreli/README.md) | paper, 21cmFAST and LoReLi figures, captions, rebuild commands |
 | [ebm.md](docs/ebm.md) | the original energy-based model |
 
 ## Other code
