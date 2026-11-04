@@ -1,0 +1,4 @@
+{
+  "rhizome": {"label": "Rhizome (2-D slice-wise)", "color": "#de2d26", "ls": "-"},
+  "ufno": {"label": "fno-21cm 3-D (cnn + whno)", "color": "0.15", "ls": "--"}
+}
