@@ -3,6 +3,7 @@
     python scripts/make_rhizome_network.py \\
         --checkpoint runs/rhizome_long_seed1/fit/best.pt \\
         --cache runs/rhizome_long_seed1/slices.h5 --out docs/figures/rhizome_network
+    # side-by-side variant: --layout horizontal --out docs/figures/rhizome_network_horizontal
 
 (a) A U-Net-style hierarchy: cells meet only at common coarse ancestors.
 (b) An ungated global kernel, as in a Fourier layer: the trained rhizome's own
@@ -146,6 +147,8 @@ def main():
     ap.add_argument("--nodes", type=int, default=8, help="lattice nodes per axis")
     ap.add_argument("--update", type=int, default=0, help="update shown in (c), 1-based; 0 = last")
     ap.add_argument("--out", default="docs/figures/rhizome_network")
+    ap.add_argument("--layout", choices=("vertical", "horizontal"), default="vertical",
+                    help="panels stacked (one column, 3.4 x 9.3 in) or side by side (full width, 7.0 x 2.85 in)")
     args = ap.parse_args()
 
     model, ck = load_checkpoint(args.checkpoint)
@@ -186,7 +189,10 @@ def main():
         "text.usetex": True, "font.family": "serif", "font.size": 8, "axes.titlesize": 8.5,
         "text.latex.preamble": r"\usepackage{amsmath}\usepackage{bm}",
     })
-    fig, axes = plt.subplots(3, 1, figsize=(3.4, 9.3), constrained_layout=True)
+    if args.layout == "horizontal":
+        fig, axes = plt.subplots(1, 3, figsize=(7.0, 2.85), constrained_layout=True)
+    else:
+        fig, axes = plt.subplots(3, 1, figsize=(3.4, 9.3), constrained_layout=True)
 
     background(axes[0], truth, n)
     tree_panel(axes[0], n, int(np.log2(args.nodes)), (float(nodes[rx][1]), float(nodes[rx][0])),
