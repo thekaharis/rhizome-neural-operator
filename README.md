@@ -1,4 +1,4 @@
-# Rhizome neural operator
+# Rhizome Neural Operator
 
 A neural operator for 21-cm reionization lightcones. It predicts the neutral fraction
 x<sub>HI</sub> and the brightness temperature T<sub>b</sub> on one transverse slice of a lightcone. Its
