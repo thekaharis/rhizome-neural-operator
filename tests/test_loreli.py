@@ -1,0 +1,443 @@
+import json
+import pickle
+from types import SimpleNamespace
+
+import h5py
+import numpy as np
+import pytest
+import torch
+
+from ebm21cm import loreli_metrics as lm
+from ebm21cm.data.loreli import (LoreliAdapter, LoreliCone, band_planes, band_planes_torch, linear_velocity,
+                                 loreli_redshifts, mirror_pad, pad_to, read_cube, resample_transverse,
+                                 training_stats, velocity_shape, velocity_shape_torch)
+from ebm21cm.evaluate_loreli import Accumulator, fingerprint, load_completed
+from ebm21cm.loreli_inference import area_matrix, downsample_transverse, load_model, map_to_native
+from ebm21cm.model.remap import remapped_model, remap_spectral_conv
+from ebm21cm.model.rhizome import build_model
+
+REAL_STATS = {"bands": [(-32, -16), (-16, -8), (-8, -4), (-3, -2), (-2, -1), (-1, 0), (0, 1), (1, 2),
+                        (2, 3), (3, 4), (4, 8), (8, 16), (16, 32)],
+              "normalization": {"density": {"offset": 0.0, "scale": 10.0},
+                                "los_velocity": {"offset": 0.0, "scale": 1e-17}},
+              "param_names": [f"p{i}" for i in range(11)],
+              "scalar_names": ["1/(1+z)"] + [f"p{i}" for i in range(11)] + [f"h{i}" for i in range(26)]}
+
+STATS = {"bands": [(-4, -2), (-1, 0), (0, 1), (2, 4)],
+         "normalization": {"density": {"offset": 0.0, "scale": 10.0},
+                           "los_velocity": {"offset": 0.0, "scale": 1e-17}},
+         "param_names": [f"p{i}" for i in range(11)],
+         "scalar_names": ["1/(1+z)"] + [f"p{i}" for i in range(11)] + [f"h{i}" for i in range(8)]}
+
+
+def write_cone(path, n_native=16, n_los=32, seed=0, tail=4):
+    """A tiny five-field file: index 0 is low z, a NaN/zero tail at the low-z end."""
+    rng = np.random.default_rng(seed)
+    cube = np.zeros((n_native, n_native, n_los, 5), np.float32)
+    cube[..., 0] = 1.0
+    cube[..., 1] = 100.0
+    cube[..., 2] = np.linspace(0.9, 0.0, n_los)[None, None, :]
+    cube[..., 3] = (1 + 0.3 * rng.standard_normal((n_native, n_native, n_los))).astype(np.float32) * 1e-9
+    cube[..., 4] = (-20 + 5 * rng.standard_normal((n_native, n_native, n_los))).astype(np.float32)
+    if tail:
+        cube[:, :, :tail, 3] = 0.0
+        cube[:, :, :tail, 4] = np.nan
+    cube.tofile(path)
+    return cube
+
+
+def test_redshifts_are_uniform_in_z():
+    # LoReLi's planes are uniform in redshift (checked against the 21ssd box histories), so the
+    # comoving spacing shrinks from ~3.5 Mpc at z = 5 to ~0.8 Mpc at z = 15.
+    z, distance = loreli_redshifts((5.0, 15.0), 1536)
+    assert z[0] == 5.0 and z[-1] == 15.0
+    assert np.allclose(np.diff(z), 10.0 / 1535, rtol=1e-12)
+    from ebm21cm.cosmology import FlatLCDM
+
+    cosmo = FlatLCDM(0.308, 0.678)
+    assert distance[0] == 0.0
+    assert distance[-1] == pytest.approx(cosmo.comoving_distance(15.0) - cosmo.comoving_distance(5.0), rel=1e-9)
+    step = np.diff(distance)
+    assert np.all(step > 0) and np.all(np.diff(step) < 0)
+    assert step[0] == pytest.approx(3.50, abs=0.02) and step[-1] == pytest.approx(0.81, abs=0.02)
+
+
+def test_linear_velocity_on_the_nonuniform_uniform_z_axis(tmp_path):
+    """The velocity FFT runs on a uniform comoving grid, although LoReLi's planes are uniform in z.
+
+    delta = A cos(kx x) cos(kz chi) gives v = -A H f kz / (kx^2 + kz^2) cos(kx x) sin(kz chi).
+    """
+    from ebm21cm.data.loreli import hubble_growth
+
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00011.dat"
+    n_native, n_los, z_range, amp, wavelength = 8, 384, (5.0, 9.0), 0.3, 120.0
+    _, chi = loreli_redshifts(z_range, n_los)
+    kz, kx = 2 * np.pi / wavelength, 2 * np.pi / 294.0
+    x = np.arange(n_native) * 294.0 / n_native
+    cube = np.zeros((n_native, n_native, n_los, 5), np.float32)
+    cube[..., 0], cube[..., 1], cube[..., 2], cube[..., 4] = 1.0, 100.0, 0.5, 5.0
+    cube[..., 3] = 1e-9 * (1 + amp * np.cos(kx * x)[:, None, None] * np.cos(kz * chi)[None, None, :])
+    cube.tofile(path)
+    cone = LoreliCone(path, z_range=z_range, n_native=n_native, n_los=n_los)
+    spacing = np.diff(cone.distances)
+    assert spacing.max() / spacing.min() > 1.5 and cone.valid.sum() > 370
+    adapter = LoreliAdapter(cone, REAL_STATS, velocity="linear", device="cpu")
+    n = len(adapter.target_distance)
+    a, b = n // 6, 5 * n // 6                               # away from the FFT's periodic seam
+    d = adapter.target_distance[a:b]
+    velocity = adapter._velocity_at(d)[0, 0] * hubble_growth(adapter.z_target[a:b])
+    expected = -amp * kz / (kx ** 2 + kz ** 2) * np.sin(kz * d) * hubble_growth(adapter.z_target[a:b])
+    assert np.max(np.abs(velocity - expected)) < 0.01 * np.max(np.abs(expected))
+    with pytest.raises(ValueError):
+        adapter._velocity_at(d[:3] + 0.3)                   # off the uniform target grid
+
+
+def test_corrupt_dtb_planes_are_invalid(tmp_path):
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00012.dat"
+    cube = write_cone(path, n_native=8, n_los=40, tail=4)
+    cube[3, 3, 20, 4] = 1.0e12                              # one absurd cell in an interior plane
+    cube.tofile(path)
+    cone = LoreliCone(path, z_range=(5.0, 5.4), n_native=8, n_los=40)
+    assert not cone.valid[20]
+    assert cone.valid[21:].all() and not cone.valid[:21].any()   # longest clean run kept
+
+
+def test_reader_orientation_and_validity_mask(tmp_path):
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00001.dat"
+    write_cone(path, n_native=16, n_los=32, tail=4)
+    cone = LoreliCone(path, z_range=(5.0, 5.4), n_native=16, n_los=32)
+    # The empty low-z tail is dropped, index 0 stays the low-z end, and the run is contiguous.
+    assert not cone.valid[:4].any()
+    assert cone.valid[4:].all() and cone.n_slices == 28
+    assert cone.z[0] < cone.z[-1]
+    xhi, tb = cone.history()
+    assert xhi[4] < xhi[-1]  # low z is more ionized
+    fields = cone.read(4, 8)
+    assert fields["xion"].shape == (16, 16, 4)
+    assert np.allclose(1 - fields["xion"][..., 0], xhi[4])
+
+
+def test_delta_has_zero_slice_mean(tmp_path):
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00002.dat"
+    write_cone(path, n_native=12, n_los=20, tail=0)
+    cone = LoreliCone(path, z_range=(5.0, 5.2), n_native=12, n_los=20, density_mean="slice")
+    dens = cone.read(0, 20)["dens"]
+    delta = cone.delta(dens)
+    assert np.abs(delta.mean((0, 1))).max() < 1e-6
+    assert delta.std() == pytest.approx(0.3, abs=0.03)
+
+
+def test_mirror_pad_reflects_without_repeating_the_edge():
+    x = np.arange(5)
+    assert np.array_equal(mirror_pad(x, 2), [2, 1, 0, 1, 2, 3, 4, 3, 2])
+    plane = np.arange(16).reshape(4, 4)
+    padded = pad_to(plane, 8)
+    assert padded.shape == (8, 8)
+    assert np.array_equal(padded[2:6, 2:6], plane)
+    assert padded[1, 2:6].tolist() == [4, 5, 6, 7]
+
+
+def test_resample_transverse_keeps_a_constant_and_maps_a_ramp():
+    rng = np.random.default_rng(0)
+    constant = np.full((16, 16, 3), 7.0, np.float32)
+    assert np.allclose(resample_transverse(constant, 21), 7.0)
+    ramp = np.broadcast_to(np.arange(16, dtype=np.float32)[None, :, None], (16, 16, 2))
+    out = resample_transverse(ramp, 32)
+    expected = (np.arange(32) + 0.5) * 16 / 32 - 0.5
+    assert np.abs(out[0, :, 0] - expected).max() < 0.6  # bicubic through a piecewise-linear ramp
+    assert np.all(np.diff(out[0, :, 0]) > 0)
+
+
+def test_band_planes_match_direct_means():
+    rng = np.random.default_rng(1)
+    values = rng.standard_normal((7, 5, 20)).astype(np.float32)
+    bands = [(0, 1), (1, 3), (-1, 0)]
+    centers = np.array([1, 5, 10])
+    out = band_planes(values, centers, bands)
+    for i, c in enumerate(centers):
+        for b, (lo, hi) in enumerate(bands):
+            assert np.allclose(out[i, b], values[:, :, c + lo:c + hi].mean(-1), atol=1e-6)
+
+
+def test_linear_velocity_matches_the_analytic_mode():
+    from ebm21cm.data.loreli import hubble_growth
+
+    n, cell, z = 64, 2.0, 8.0
+    k = 2 * np.pi * 3 / (n * cell)
+    delta = np.cos(k * np.arange(n) * cell)[None, None, :].repeat(n, 0).repeat(n, 1).astype(np.float32)
+    velocity = linear_velocity(delta, z, cell=cell)
+    # For delta = cos(k z), v = i H f k delta_k / k^2 = -H f sin(k z) / k.
+    expected = -hubble_growth(z) / k * np.sin(k * np.arange(n) * cell)
+    assert np.allclose(velocity[0, 0], expected, rtol=2e-2, atol=1e-22)
+
+
+def test_adapter_shapes_and_scalars(tmp_path):
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00003.dat"
+    write_cone(path, n_native=16, n_los=32, tail=4)
+    cone = LoreliCone(path, z_range=(5.0, 5.4), n_native=16, n_los=32)
+    adapter = LoreliAdapter(cone, STATS, velocity="zero")
+    inputs = adapter.inputs(2, 5)
+    assert inputs["cond"].shape == (3, 2 * len(STATS["bands"]), 280, 280)
+    assert inputs["scalars"].shape == (3, 1 + 11 + 2 * len(STATS["bands"]))
+    assert inputs["phys"].shape == (3, 1, 280, 280)
+    assert np.isfinite(inputs["cond"]).all() and np.isfinite(inputs["scalars"]).all()
+    assert np.allclose(inputs["scalars"][:, 0], 1 / (1 + inputs["z"]), atol=1e-6)
+    assert np.allclose(inputs["scalars"][:, 1:12], 0.0)
+    history = inputs["scalars"][:, 12:12 + len(STATS["bands"])]
+    assert np.all((history >= 0) & (history <= 1.01)) and history.max() > 0
+    # No velocity: the last half of the conditioning is exactly zero.
+    assert np.allclose(inputs["cond"][:, len(STATS["bands"]):], 0.0)
+
+
+def test_torch_input_path_matches_the_numpy_path(tmp_path):
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00006.dat"
+    write_cone(path, n_native=16, n_los=32, tail=4)
+    cone = LoreliCone(path, z_range=(5.0, 5.4), n_native=16, n_los=32)
+    numpy_inputs = LoreliAdapter(cone, STATS, velocity="zero").inputs(2, 5)
+    torch_inputs = LoreliAdapter(cone, STATS, velocity="zero", force_torch=True).inputs(2, 5)
+    assert np.allclose(numpy_inputs["cond"], torch_inputs["cond"].numpy(), atol=1e-5)
+    assert np.allclose(numpy_inputs["phys"], torch_inputs["phys"].numpy(), atol=1e-5)
+    assert np.allclose(numpy_inputs["scalars"], torch_inputs["scalars"], atol=1e-6)
+
+
+def test_linear_velocity_torch_matches_numpy_on_the_real_geometry(tmp_path):
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00007.dat"
+    write_cone(path, n_native=16, n_los=32, tail=4)
+    cone = LoreliCone(path, z_range=(5.0, 5.4), n_native=16, n_los=32)
+    numpy_adapter = LoreliAdapter(cone, REAL_STATS, velocity="linear", device="cpu")
+    torch_adapter = LoreliAdapter(cone, REAL_STATS, velocity="linear", device="cpu", force_torch=True)
+    assert numpy_adapter.n_out == 206 and numpy_adapter.domain == 280
+    assert numpy_adapter._vel_shape.shape == torch_adapter._vel_shape.shape
+    assert np.allclose(numpy_adapter._vel_shape, torch_adapter._vel_shape, atol=1e-5)
+    a = numpy_adapter.inputs(2, 5)
+    b = torch_adapter.inputs(2, 5)
+    assert a["cond"].shape == (3, 26, 280, 280)
+    assert np.allclose(a["cond"], b["cond"].numpy(), atol=1e-4)
+    assert np.allclose(a["phys"], b["phys"].numpy(), atol=1e-4)
+
+
+def test_read_cube_equality(tmp_path):
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00008.dat"
+    cube = write_cone(path, n_native=12, n_los=20, tail=0)
+    raw = read_cube(path)
+    assert np.array_equal(raw, cube.reshape(-1))
+    from_path = LoreliCone(path, z_range=(5.0, 5.2), n_native=12, n_los=20)
+    from_data = LoreliCone(path, z_range=(5.0, 5.2), n_native=12, n_los=20, data=raw)
+    assert np.array_equal(from_path.data, from_data.data)
+    assert np.array_equal(from_path.valid, from_data.valid)
+    assert np.allclose(from_path.history()[0], from_data.history()[0])
+
+
+def test_band_planes_torch_bounds_check():
+    values = torch.zeros(8, 8, 20)
+    with pytest.raises(ValueError):
+        band_planes_torch(values, np.array([18]), [(-1, 3)])
+    with pytest.raises(ValueError):
+        band_planes_torch(values, np.array([1]), [(-3, 0)])
+
+
+def _fingerprint_args(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "best.pt").write_bytes(b"checkpoint")
+    data = tmp_path / "data"
+    data.mkdir()
+    return SimpleNamespace(run=run, cache=tmp_path / "cache.h5", data=data, l_perp=294.0, border=4,
+                           los_margin=28, slice_stride=1, min_per_stage=8, shape_per_stage=0,
+                           baseline_per_stage=32, no_baselines=False, density_mean="slice", velocity="linear",
+                           device="cpu", force_torch_inputs=False, n_native=128, n_los=1536,
+                           z_range=(5.0, 15.0), z_window=None, ids=None, limit=None)
+
+
+def test_resume_fingerprint_and_partial_pickle(tmp_path):
+    args = _fingerprint_args(tmp_path)
+    fp = fingerprint(args, {"step": 1})
+    out = tmp_path / "out"
+    out.mkdir()
+    stages = {name: Accumulator() for name, _, _ in lm.STAGES}
+    record = {"sim": 1, "stages": {name: stages[name].metrics() for name in stages}}
+    (out / "cone_1.pkl").write_bytes(pickle.dumps({"fingerprint": fp, "record": record, "stages": stages}))
+    (out / "cone_2.pkl").write_bytes(b"partial")
+    totals, records, done = load_completed(out, fp)
+    assert done == {1} and len(records) == 1
+    assert not (out / "cone_2.pkl").exists()
+    args.device = "cuda"
+    with pytest.raises(SystemExit):
+        load_completed(out, fingerprint(args, {"step": 1}))
+
+
+def test_area_matrix_rows_sum_to_one():
+    weights = area_matrix(128, 206)
+    assert weights.shape == (128, 206)
+    assert np.allclose(weights.sum(1), 1.0, atol=1e-6)
+    assert np.all(weights >= 0)
+
+
+def test_map_to_native_preserves_a_constant_and_masks_the_border(tmp_path):
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00004.dat"
+    write_cone(path, n_native=16, n_los=32, tail=0)
+    cone = LoreliCone(path, z_range=(5.0, 5.4), n_native=16, n_los=32)
+    adapter = LoreliAdapter(cone, STATS, velocity="zero")
+    n = len(adapter.target_distance)
+    xhi = np.full((n, 280, 280), 0.25, np.float32)
+    tb = np.full_like(xhi, -3.0)
+    out_x, out_t, keep = map_to_native(xhi, tb, adapter, cone, border=10)
+    assert np.allclose(out_x[cone.valid], 0.25)
+    assert np.allclose(out_t[cone.valid], -3.0)
+    assert keep.sum() < 16 * 16
+
+
+def test_downsample_transverse_keeps_the_axis_order(tmp_path):
+    path = tmp_path / "lightcone_xa_tpHI_xion_dens_dtb_no_rsd_simu00005.dat"
+    write_cone(path, n_native=16, n_los=32, tail=0)
+    cone = LoreliCone(path, z_range=(5.0, 5.4), n_native=16, n_los=32)
+    adapter = LoreliAdapter(cone, STATS, velocity="zero")
+    ramp = (np.arange(280)[:, None] + 2 * np.arange(280)[None, :]).astype(np.float32)
+    out = downsample_transverse(ramp, adapter, cone)
+    weights = area_matrix(16, adapter.n_out)
+    expected = weights @ ramp[37:243, 37:243] @ weights.T
+    assert np.allclose(out, expected, atol=1e-4)
+
+
+def _tiny_model_config():
+    return {"in_channels": 4, "out_channels": 2, "scalar_dim": 3, "width": 8, "modes": 4,
+            "n_steps": 3, "step_size": 0.5}
+
+
+def test_remap_reproduces_a_2x2_tiled_prediction():
+    torch.manual_seed(0)
+    config = _tiny_model_config()
+    native = build_model(config)
+    model = remapped_model(config, native.state_dict(), factor=2)
+    x = torch.randn(2, 4, 32, 32)
+    scalars = torch.randn(2, 3)
+    with torch.no_grad():
+        a = native(x, scalars)
+        tiled = torch.cat([torch.cat([x, x], -1)] * 2, -2)
+        b = model(tiled, scalars)
+    assert torch.allclose(a, b[:, :, :32, :32], atol=1e-6)
+    assert torch.allclose(b[:, :, :32, :32], b[:, :, :32, 32:], atol=1e-6)
+    assert torch.allclose(b[:, :, :32, :32], b[:, :, 32:, :32], atol=1e-6)
+
+
+def test_remap_factor_one_is_the_identity():
+    torch.manual_seed(1)
+    config = _tiny_model_config()
+    native = build_model(config)
+    same = remapped_model(config, native.state_dict(), factor=1)
+    x = torch.randn(2, 4, 32, 32)
+    with torch.no_grad():
+        assert torch.equal(native(x, torch.zeros(2, 3)), same(x, torch.zeros(2, 3)))
+
+
+def test_remap_interpolates_odd_modes_and_copies_even_ones():
+    rng = np.random.default_rng(0)
+    modes = 3
+    axis = torch.as_tensor(rng.standard_normal((2, 2, modes - 1)) + 0j)
+    positive = torch.as_tensor(rng.standard_normal((2, 2, modes, modes - 1)) + 0j)
+    negative = torch.as_tensor(rng.standard_normal((2, 2, modes - 1, modes - 1)) + 0j)
+    dc = torch.as_tensor(rng.standard_normal((2, 2)))
+    dc2, axis2, pos2, neg2 = remap_spectral_conv(dc, axis, positive, negative, modes, factor=2)
+    assert axis2.shape == (2, 2, 2 * modes - 1)
+    assert pos2.shape == (2, 2, 2 * modes, 2 * modes - 1)
+    assert neg2.shape == (2, 2, 2 * modes - 1, 2 * modes - 1)
+    assert torch.equal(dc2, dc)
+    # index 0 is physical mode 1: even new index 1 maps to old index 0 exactly
+    assert torch.allclose(axis2[:, :, 1], axis[:, :, 0])
+    assert torch.allclose(axis2[:, :, 3], axis[:, :, 1])
+    # odd new index 2 is halfway between old modes 1 and 2
+    assert torch.allclose(axis2[:, :, 2], (axis[:, :, 0] + axis[:, :, 1]) / 2)
+    assert torch.allclose(pos2[:, :, 0, 1], positive[:, :, 0, 0])
+    assert torch.allclose(pos2[:, :, 0, 2], (positive[:, :, 0, 0] + positive[:, :, 0, 1]) / 2)
+    assert torch.allclose(neg2[:, :, 1, 1], negative[:, :, 0, 0])
+
+
+def test_load_model_refuses_node_phase(tmp_path):
+    best = {"model_config": _tiny_model_config(), "model": build_model(_tiny_model_config()).state_dict(),
+            "node_phase": {"input": True}}
+    torch.save(best, tmp_path / "best.pt")
+    with pytest.raises(SystemExit):
+        load_model(tmp_path)
+
+
+def test_stats_reader(tmp_path):
+    path = tmp_path / "cache.h5"
+    with h5py.File(path, "w") as h:
+        h.attrs["bands"] = json.dumps([[-1, 0], [0, 1]])
+        h.attrs["normalization"] = json.dumps({"density": {"offset": 0, "scale": 1}})
+        h.attrs["param_names"] = json.dumps(["a", "b"])
+        h.attrs["scalar_names"] = json.dumps(["1/(1+z)", "a", "b", "h", "h"])
+    stats = training_stats(path)
+    assert stats["bands"] == [(-1, 0), (0, 1)] and stats["param_names"] == ["a", "b"]
+
+
+def test_metrics_on_a_synthetic_front():
+    x = np.linspace(0, 1, 64)[:, None].repeat(64, 1)
+    true = np.where(x < 0.5, 0.0, 1.0)
+    pred = true.copy()
+    assert lm.rmse(pred, true) == 0
+    assert lm.iou_matched(pred, true) == 1
+    noisy = np.clip(true + 0.2 * np.random.default_rng(0).standard_normal(true.shape), 0, 1)
+    assert 0 < lm.iou_matched(noisy, true) < 1
+    profile = lm.front_profile(true, true, 1.0, lm.FRONT_EDGES)
+    assert profile is not None and profile[0].sum() > 0
+
+
+def _ramp_with_fraction(fraction, size=64):
+    """A continuous x_HI field whose true ionized fraction is exactly ``fraction``."""
+    total = size * size
+    n = int(round(fraction * total))
+    values = np.concatenate([np.linspace(0.0, 0.49, n, endpoint=False),
+                             np.linspace(0.51, 1.0, total - n)])
+    return values.reshape(size, size)
+
+
+def test_iou_matched_continuous_identity_at_all_fractions():
+    """An exact prediction gives IoU 1, including the f=0.2/0.8 cases the old cut capped at 0.25."""
+    for fraction in (0.2, 0.5, 0.8):
+        true = _ramp_with_fraction(fraction)
+        assert lm.iou_matched(true.copy(), true) == pytest.approx(1.0, abs=1e-12)
+
+
+def test_iou_matched_monotone_transform_identity():
+    true = _ramp_with_fraction(0.3)
+    for transform in (lambda value: value ** 3, lambda value: np.exp(value)):
+        assert lm.iou_matched(transform(true), true) == pytest.approx(1.0, abs=1e-12)
+
+
+def test_iou_matched_selects_exact_count_with_ties():
+    true = _ramp_with_fraction(0.25, size=32)
+    n = int(np.count_nonzero(true < 0.5))
+    pred = np.zeros_like(true)  # every cell tied
+    guess = lm.ionized_mask_matched(pred, true)
+    assert int(guess.sum()) == n
+    # Deterministic tie-break: the first n cells in flattened order.
+    expected = np.zeros(true.size, dtype=bool)
+    expected[:n] = True
+    assert np.array_equal(guess.ravel(), expected)
+    assert np.array_equal(guess, lm.ionized_mask_matched(pred, true))
+
+
+def test_iou_matched_binary_matched_baseline_unchanged():
+    """A binary baseline with the truth's ionized count scores the same as the fixed-threshold IoU."""
+    truth = _ramp_with_fraction(0.35, size=32)
+    n = int(np.count_nonzero(truth < 0.5))
+    rng = np.random.default_rng(7)
+    pred = np.ones(truth.size)
+    pred[rng.permutation(truth.size)[:n]] = 0.0
+    pred = pred.reshape(truth.shape)
+    ion = truth < 0.5
+    guess = pred < 0.5
+    expected = np.count_nonzero(ion & guess) / np.count_nonzero(ion | guess)
+    assert lm.iou_matched(pred, truth) == pytest.approx(expected, abs=1e-12)
+
+
+def test_iou_matched_orientation_regression():
+    true = _ramp_with_fraction(0.2)
+    assert lm.iou_matched(1.0 - true, true) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_iou_matched_float16_plateaus():
+    true = _ramp_with_fraction(0.4)
+    pred = true.astype(np.float16).astype(np.float64)
+    assert lm.iou_matched(pred, true) == pytest.approx(1.0, abs=1e-12)

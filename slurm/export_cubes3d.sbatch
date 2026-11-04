@@ -1,6 +1,7 @@
 #!/bin/bash
 # Export full-cone test predictions of a 3-D rhizome (RHIZOME=run dir) or fno-21cm
 # LOS-window model (FNO_CKPT=best.pt) in fno-21cm's eval_cubes formats.
+# EXTRA: further export_cubes3d arguments (e.g. --native-cyl PREFIX --cyl-only).
 #   sbatch --export=ALL,RHIZOME=runs/rhizome3d/w48_m36_h200,TAG=rhizome3d_w48 slurm/export_cubes3d.sbatch
 #SBATCH --job-name=rhz-export3d
 #SBATCH --partition=gpu
@@ -22,4 +23,4 @@ if [ -n "${RHIZOME:-}" ]; then SRC=(--rhizome "$RHIZOME"); else SRC=(--fno "${FN
 nvidia-smi -L || true
 # shellcheck disable=SC2086
 python -m ebm21cm.export_cubes3d "${SRC[@]}" --tag "$TAG" --out-dir "$OUT_DIR" --split "${SPLIT:-test}" \
-    --h5-cones $H5_CONES
+    --h5-cones $H5_CONES ${EXTRA:-}

@@ -26,14 +26,15 @@ import torch
 
 from .data.cache import band_extent
 from .data.mf_slices import FNO_ROOT, PREPARATION, band_means, fno_dataset
-from .model.rhizome import RhizomeOperator2d
+from .model.rhizome import build_model
 from .train_rhizome_mf2d import tb_normalized
 
 
-def slice_inputs(dataset, row, idx, head, LOSWindowConfig, bands, ip, chunk=512):
+def slice_inputs(dataset, row, idx, head, LOSWindowConfig, bands, ip, chunk=512, wide=()):
     """cond, scalars, phys, x_HI, normalized T_b for sorted native indices ``idx``
     (same arithmetic as ``mf_slices.build``)."""
-    below, above = band_extent(bands)
+    wide = [tuple(b) for b in wide]
+    below, above = band_extent(list(bands) + wide)
     halo = max(below, above + 1)
     config = LOSWindowConfig(mode="contiguous", size=chunk + 2 * halo, halo=halo, windows_per_cone=1)
     parts = {k: [] for k in ("cond", "scalars", "phys", "xhi", "tb")}
@@ -47,13 +48,75 @@ def slice_inputs(dataset, row, idx, head, LOSWindowConfig, bands, ip, chunk=512)
             phys = head.physical_factor(x[None])[0].numpy()
         x = x.numpy()
         j = sel - start + halo
-        parts["cond"].append(np.concatenate([band_means(x[0], j, bands), band_means(x[1], j, bands)], 1))
-        hist = np.concatenate([band_means(x[-2, 0, 0], j, bands), band_means(x[-1, 0, 0], j, bands)], 1)
+        parts["cond"].append(np.concatenate([band_means(x[0], j, bands), band_means(x[1], j, bands)]
+                                            + ([band_means(x[0], j, wide)] if wide else []), 1))
+        hist = np.concatenate([band_means(x[-2, 0, 0], j, bands), band_means(x[-1, 0, 0], j, bands)]
+                              + ([band_means(x[-2, 0, 0], j, wide), band_means(x[-1, 0, 0], j, wide)] if wide else []), 1)
         parts["scalars"].append(np.concatenate([x[2, 0, 0, j][:, None], x[ip, 0, 0][:, j].T, hist], 1))
         parts["phys"].append(np.moveaxis(phys[..., j], -1, 0))
         parts["xhi"].append(np.moveaxis(y[0].numpy()[..., j], -1, 0))
         parts["tb"].append(np.moveaxis(y[1].numpy()[..., j], -1, 0))
     return {k: np.concatenate(v) for k, v in parts.items()}
+
+
+def _band_means_gpu(values, centers, bands):
+    """(len(centers), len(bands), *values.shape[:-1]) band means along the last axis, float64 on the device."""
+    csum = torch.nn.functional.pad(torch.cumsum(values.double(), -1), (1, 0))
+    lo = torch.tensor([b[0] for b in bands], device=values.device)
+    hi = torch.tensor([b[1] for b in bands], device=values.device)
+    c = centers[:, None]
+    out = (csum[..., c + hi] - csum[..., c + lo]) / (hi - lo).double()  # (..., n, B)
+    return out.movedim(-2, 0).movedim(-1, 1) if values.ndim > 1 else out
+
+
+def iter_slice_inputs_gpu(dataset, row, idx, head, LOSWindowConfig, bands, ip, device, chunk=512, wide=(),
+                          targets=False, prefetch=True):
+    """Per-chunk device inputs for sorted native indices ``idx`` (one chunk = one
+    fno-21cm window of ``chunk`` cores). With ``prefetch`` a background thread reads
+    the next window from disk while the current chunk is processed, so file I/O
+    overlaps the GPU work. Same arithmetic as the CPU path (band sums in float64)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    wide = [tuple(b) for b in wide]
+    below, above = band_extent(list(bands) + wide)
+    halo = max(below, above + 1)
+    config = LOSWindowConfig(mode="contiguous", size=chunk + 2 * halo, halo=halo, windows_per_cone=1)
+    ip_t = torch.tensor(ip, device=device)
+    starts = [s for s in range(0, len(dataset.redshifts[row]), chunk) if np.any((idx >= s) & (idx < s + chunk))]
+    read = lambda s: dataset.window(row, s - halo, config)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(read, starts[0]) if prefetch and starts else None
+        for i, start in enumerate(starts):
+            sample = pending.result() if prefetch else read(start)
+            if prefetch and i + 1 < len(starts):
+                pending = pool.submit(read, starts[i + 1])
+            sel = idx[(idx >= start) & (idx < start + chunk)]
+            x = sample["x"].to(device, non_blocking=True)
+            j = torch.as_tensor(sel - start + halo, device=device)
+            with torch.no_grad():
+                phys = head.physical_factor(x[None])[0]
+            cond = [_band_means_gpu(x[0], j, bands), _band_means_gpu(x[1], j, bands)]
+            hist = [_band_means_gpu(x[-2, 0, 0], j, bands), _band_means_gpu(x[-1, 0, 0], j, bands)]
+            if wide:
+                cond.append(_band_means_gpu(x[0], j, wide))
+                hist += [_band_means_gpu(x[-2, 0, 0], j, wide), _band_means_gpu(x[-1, 0, 0], j, wide)]
+            out = {"cond": torch.cat(cond, 1).float(),
+                   "scalars": torch.cat([x[2, 0, 0, j][:, None].double(), x[ip_t, 0, 0][:, j].T.double()] + hist,
+                                        1).float(),
+                   "phys": phys[..., j].movedim(-1, 0).float()}
+            if targets:
+                y = sample["y"].to(device, non_blocking=True)
+                out["xhi"], out["tb"] = y[0][..., j].movedim(-1, 0), y[1][..., j].movedim(-1, 0)
+            yield out
+
+
+def slice_inputs_gpu(dataset, row, idx, head, LOSWindowConfig, bands, ip, device, chunk=512, wide=(),
+                     targets=False, prefetch=True):
+    """All of ``iter_slice_inputs_gpu`` concatenated: device tensors cond (n, C, H, W),
+    scalars (n, S), phys (n, H, W) (and xhi / normalized tb with ``targets``)."""
+    parts = list(iter_slice_inputs_gpu(dataset, row, idx, head, LOSWindowConfig, bands, ip, device, chunk, wide,
+                                       targets, prefetch))
+    return {k: torch.cat([p[k] for p in parts]) for k in parts[0]}
 
 
 def main(argv=None):
@@ -68,20 +131,31 @@ def main(argv=None):
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--max-cones", type=int, default=None)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--cpu-inputs", action="store_true", help="build the inputs on the CPU (slower; the reference path)")
+    ap.add_argument("--native-cyl", default=None, metavar="PREFIX",
+                    help="also write native-resolution cylindrical x_HI/T_b power (ebm21cm.native_cyl) to PREFIX_<field>.npz")
+    ap.add_argument("--cyl-z", type=float, nargs="+", default=[7.0, 9.0, 11.0, 14.0, 17.0])
+    ap.add_argument("--cyl-stages", type=float, nargs="+", default=None,
+                    help="centre the native-cyl chunks per cone at these true slice-mean x_HI (history from the "
+                         "reference cubes) instead of --cyl-z")
+    ap.add_argument("--cyl-only", action="store_true", help="only the native cylindrical power, no cubes")
     args = ap.parse_args(argv)
 
     meta = json.loads((args.run / "metadata.json").read_text())
     attrs = meta["cache_attrs"]
     bands = [tuple(b) for b in json.loads(attrs["bands"])]
+    wide = [tuple(b) for b in json.loads(attrs.get("wide_bands", "[]"))]
     # Evaluate on the cleaned-T_b multi-field preparation (the reference cubes' data), whatever
     # preparation the training cache came from: inputs are identical, raw files lack the T_b cleaning.
     dataset, rows, LOSWindowConfig, head, _, param_names = fno_dataset(args.preparation, FNO_ROOT, attrs["history"])
     ip = [list(dataset.channel_names).index(p) for p in param_names]
     best = torch.load(args.run / "best.pt", map_location="cpu", weights_only=False)
     device = torch.device(args.device)
-    model = RhizomeOperator2d(**best["model_config"]).to(device).eval()
+    model = build_model(best["model_config"]).to(device).eval()
     model.load_state_dict(best["model"])
     tb_off, tb_scale = best["tb_norm"]
+    keep = best.get("scalar_keep")  # history-ablation models see a subset of the scalars
+    keep_t = None if keep is None else torch.as_tensor(keep, device=device)
     # Sample ids come from the file names (mirror row != sample id after row 72), as in export_cubes3d.
     row_of = {int(re.findall(r"\d+", Path(dataset.file_paths[r]).stem)[-1]): int(r) for r in rows["test"]}
 
@@ -92,19 +166,43 @@ def main(argv=None):
         with torch.no_grad():
             for a in range(0, n, args.batch_size):
                 b = slice(a, a + args.batch_size)
-                out = model(torch.from_numpy(inp["cond"][b]).to(device), torch.from_numpy(inp["scalars"][b]).to(device))
-                t = tb_normalized(out, torch.from_numpy(inp["phys"][b][:, None]).to(device), best["head"], tb_off, tb_scale)
+                scal = inp["scalars"][b] if keep is None else inp["scalars"][b][:, keep]
+                out = model(torch.as_tensor(inp["cond"][b]).to(device), torch.as_tensor(scal).to(device))
+                t = tb_normalized(out, torch.as_tensor(inp["phys"][b][:, None]).to(device), best["head"], tb_off, tb_scale)
                 xhi[b] = out[:, 0].sigmoid().float().cpu().numpy()
                 tb[b] = (t[:, 0] * tb_scale + tb_off).float().cpu().numpy()
         return np.moveaxis(xhi, 0, -1), np.moveaxis(tb, 0, -1)
+
+    def run(row, idx):
+        """(x_HI pred, T_b pred [mK]) as (H, W, n) and the targets (x_HI, normalized T_b) as (n, H, W).
+
+        Default: inputs built on the GPU chunk by chunk, each chunk predicted as soon as it is
+        built while the next window is read from disk. ``--cpu-inputs``: the reference CPU path."""
+        if args.cpu_inputs:
+            inp = slice_inputs(dataset, row, idx, head, LOSWindowConfig, bands, ip, wide=wide)
+            return (*predict(inp), inp["xhi"], inp["tb"])
+        xs, ts, tx, tt = [], [], [], []
+        with torch.no_grad():
+            for g in iter_slice_inputs_gpu(dataset, row, idx, head, LOSWindowConfig, bands, ip, device, wide=wide,
+                                           targets=True):
+                for a in range(0, len(g["cond"]), args.batch_size):
+                    b = slice(a, a + args.batch_size)
+                    o = model(g["cond"][b], g["scalars"][b] if keep_t is None else g["scalars"][b][:, keep_t])
+                    t = tb_normalized(o, g["phys"][b][:, None], best["head"], tb_off, tb_scale)
+                    xs.append(o[:, 0].sigmoid().float())
+                    ts.append((t[:, 0] * tb_scale + tb_off).float())
+                tx.append(g["xhi"])
+                tt.append(g["tb"])
+        cat = lambda v: torch.cat(v).cpu().numpy()
+        return np.moveaxis(cat(xs), 0, -1), np.moveaxis(cat(ts), 0, -1), cat(tx), cat(tt)
 
     out = args.out_dir / args.tag
     out.mkdir(parents=True, exist_ok=True)
     for sid in args.native_cones:
         row = row_of[sid]
         z = np.asarray(dataset.redshifts[row])
-        inp = slice_inputs(dataset, row, np.arange(len(z)), head, LOSWindowConfig, bands, ip)
-        xhi, tb = predict(inp)
+        xhi, tb, t_xhi, t_tb = run(row, np.arange(len(z)))
+        inp = {"xhi": t_xhi, "tb": t_tb}
         (out / "native").mkdir(exist_ok=True)
         truth_tb = np.moveaxis(inp["tb"], 0, -1) * tb_scale + tb_off
         with h5py.File(out / "native" / f"cone_{sid}.h5", "w") as f:
@@ -130,11 +228,32 @@ def main(argv=None):
     (ref_tag, entries), = ref["models"].items()
     entries = entries[:args.max_cones]
     written = []
+    cyl = None
+    if args.native_cyl:
+        from .native_cyl import NativeCyl
+        cyl = NativeCyl(None if args.cyl_stages else args.cyl_z, stages=args.cyl_stages)
     for k, entry in enumerate(entries):
         sid = int(entry["cone_id"])
         row = int(entry["row"])
         if row_of.get(sid) != row:
             raise ValueError(f"cone {sid}: reference row {row} is not this sample's test row")
+        if cyl is not None:
+            zn = np.asarray(dataset.redshifts[row])
+            history = None
+            if args.cyl_stages:
+                with np.load(entry["npz"]) as d:
+                    history = (d["z_native"], d["truth"].astype(np.float64).mean((0, 1)))
+            need = cyl.needed(zn, history)
+            if need.size:
+                c_xhi, c_tb, c_txhi, c_ttb = run(row, need)
+            else:  # no chunk of this cone qualifies (stage never reached)
+                c_xhi = c_tb = np.zeros((1, 1, 0))
+                c_txhi = c_ttb = np.zeros((0, 1, 1))
+            cyl.add("xhi", sid, zn, np.moveaxis(c_txhi, 0, -1), c_xhi, history=history)
+            cyl.add("tb", sid, zn, np.moveaxis(c_ttb, 0, -1) * tb_scale + tb_off, c_tb, history=history)
+            if args.cyl_only:
+                print(f"[{k + 1}/{len(entries)}] sample {sid}: native cylindrical power", flush=True)
+                continue
         with np.load(entry["npz"]) as d:
             ref_d = {key: d[key] for key in ("truth", "tb_truth", "density", "z_native")}
         z = np.asarray(dataset.redshifts[row])
@@ -144,8 +263,8 @@ def main(argv=None):
         order = np.argsort(idx, kind="stable")
         if np.any(np.diff(idx[order]) == 0):
             raise ValueError(f"cone {sid}: repeated native slices in the reference grid")
-        inp = slice_inputs(dataset, row, idx[order], head, LOSWindowConfig, bands, ip)
-        xhi, tb = predict(inp)
+        xhi, tb, t_xhi, t_tb = run(row, idx[order])
+        inp = {"xhi": t_xhi, "tb": t_tb}
         back = np.argsort(order)
         xhi, tb = xhi[..., back], tb[..., back]
         truth = np.moveaxis(inp["xhi"], 0, -1)[..., back]
@@ -158,6 +277,10 @@ def main(argv=None):
         written.append({**entry, "npz": str(target.resolve())})
         print(f"[{k + 1}/{len(entries)}] sample {sid}: x_HI rmse {np.sqrt(np.mean((xhi - ref_d['truth']) ** 2)):.4f} "
               f"T_b rmse {np.sqrt(np.mean((tb - ref_d['tb_truth']) ** 2)):.2f} mK", flush=True)
+    if cyl is not None:
+        print("wrote", *cyl.save(args.native_cyl, args.tag), flush=True)
+        if args.cyl_only:
+            return
     manifest = {"z_grid": ref["z_grid"], "models": {args.tag: written},
                 "checkpoint": str((args.run / "best.pt").resolve()), "epoch": best.get("step"), "split": ref.get("split"),
                 "selection": f"slice-wise 2-D prediction at the slices of {ref_tag}", "fields": ref.get("fields", {})}

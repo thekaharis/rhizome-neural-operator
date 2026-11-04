@@ -1,248 +1,324 @@
-# ebm-21cm
+# Rhizome neural operator
 
-Energy-based generative model for 21cmFAST reionization fields: given the matter
-density around a lightcone slice, its redshift and the 11 simulation parameters,
-**sample** `(x_HI, T_b)` transverse slices and **score** candidate fields with an
-explicit energy.
+A neural operator for 21-cm reionization lightcones. It predicts the neutral fraction
+x<sub>HI</sub> and the brightness temperature T<sub>b</sub> on one transverse slice of a lightcone. Its
+inputs are the matter density and line-of-sight velocity around that slice, the redshift,
+and the global history the slice sits in. Slices are predicted independently and restacked
+into full cones. The model is trained on 21cmFAST and transferred to the radiative-transfer
+simulations of [LoReLi II](https://arxiv.org/abs/2411.03093).
 
-It is independent of `fno-21cm` (no imports or shared files), but reads the same
-raw lightcones.
+The defining piece is the **rhizome update**. The only interaction between cells is a
+learned translation-invariant kernel. That kernel is re-weighted, cell by cell and at every
+update, by gates that read the current state.
 
-## Rhizome neural operator
+<p align="center">
+  <img src="docs/readme/architecture.png" alt="Rhizome architecture: lift, T repeated rhizome updates with shared weights, pointwise decoder; inside one update: gates A and B, value V, FFT kernel, proposal and damped update" width="100%">
+</p>
 
-Alongside the EBM, `ebm21cm.model.rhizome.RhizomeOperator2d` makes the recurrent
-cell-to-cell interaction itself a **state-dependent integral operator**.
-Learned source and receiver gates surround a periodic interaction kernel;
-Fourier coefficients parameterize that kernel, and an FFT evaluates the
-connections efficiently. There is **no separate additive FNO or local-convolution
-message branch**. All cells update synchronously with shared weights.
+The Python package is called `ebm21cm` for historical reasons. The repository started as an
+energy-based generative model, and that code is still here (see [Other code](#other-code)).
 
-The original additive local + Fourier model, `RecurrentFNO2d`, remains available
-as a baseline. Both architectures have an untied, same-width/update-count
-comparison, and older additive checkpoints still load.
+**Contents:**
+- [The model](#the-model)
+- [The 21cmFAST reference model](#the-21cmfast-reference-model)
+- [Transfer to LoReLi II](#transfer-to-loreli-ii)
+- [Evaluation and figures](#evaluation-and-figures)
+- [Repository layout](#repository-layout)
+- [Cluster](#cluster)
+- [Tests](#tests)
+- [Documentation](#documentation)
 
-`python -m ebm21cm.train_recurrent` trains this model on the same slice cache,
-selects checkpoints using validation cones, and evaluates held-out test cones.
-This first experiment is **deterministic x_HI regression**, not a calibrated
-stochastic generator or a coherent 3-D lightcone model. It leaves the EBM
-training and sampling commands below unchanged.
+## The model
 
-See [the rhizome guide](docs/rhizome_operator.md) for the interaction equations,
-reproducible toy comparison, results, and limitations. The
-[original recurrent-operator guide](docs/recurrent_operator.md) documents the
-additive baseline and its first pilot.
+`ebm21cm.model.rhizome.RhizomeOperator2d`, in pseudocode:
 
-For long training, `python -m ebm21cm.train_rhizome` adds validation-driven
-learning-rate reductions, an explicit plateau stopping rule, and resumable
-checkpoints. See [the long-training protocol](docs/rhizome_long_training.md).
-
-## Why
-
-A deterministic regressor trained with a pointwise loss predicts the conditional
-*mean*. Where the position of an ionization front is uncertain, that mean is a
-ramp. It is sharp nowhere, and no pointwise output map can fix it (the
-`fno-21cm` contrast-map study reached this conclusion: edges are *hedged in
-position*, not blurred). A generative model avoids the averaging. Each sample is
-one plausible sharp configuration, and the ensemble mean recovers the regressor.
-
-## Model
-
-A U-Net `D(x; σ | c)` with EDM preconditioning (Karras et al. 2022) defines a
-scalar energy per sample:
-
-```
-E(x; σ | c) = ‖x − D(x; σ | c)‖² / (2σ²)          s(x) = −∇ₓE          D_eff = x + σ² s(x)
+```text
+c   = lift(LOS density / velocity bands) + embed(scalars)        # pointwise
+h_0 = tanh(c)
+repeat T times with shared weights:                              # one synchronous update U_θ
+    A, B  = 2·sigmoid(W_G [h_t; c])            receiver and source gates, channel-wise, in (0, 2)
+    V     = W_V [h_t; c]                       value
+    m_i   = A_i ⊙ (1/N) Σ_j κ_θ(r_i − r_j) (B_j ⊙ V_j)     # FFT with retained modes R_k
+    p     = tanh(W_U [h_t; m_t; c])            proposal
+    h_t+1 = (1 − Δt) h_t + Δt p                damped update, Δt = 0.5
+x_HI = sigmoid(decode(h_T)),   T_b = x_HI · phys · (1 − exp(u))   # structured T_b head
 ```
 
-- **Conservative score.** The score is the exact gradient of a scalar, so the
-  learned field is conservative by construction.
-- **Training.** Denoising score matching with the EDM loss on `D_eff`. This
-  differentiates through the network twice, costing about 2–3× a plain score
-  model.
-- **Energy values.** `E` is a number you can compare between candidate fields
-  that share the same `(σ, c)`.
-- **Metropolis sampling.** The explicit energy allows Metropolis-adjusted
-  Langevin (MALA) corrections during sampling.
-- **Reduction.** If the Jacobian of `D` is small, the score reduces to
-  `(D − x)/σ²`, and `D` is then the denoiser itself. Salimans & Ho (2021),
-  *Should EBMs model the energy or the score?*, discuss this family of
-  parameterizations.
+<img align="right" src="docs/readme/network.png" alt="How cells exchange information: (a) U-Net tree, (b) global fixed kernel, (c) rhizome with receiver and sender gates" width="270">
 
-### Inputs and targets
+- **One cross-cell operation.** The message m is the only operation that couples cells.
+  - The kernel κ<sub>θ</sub> is parameterized by its Fourier coefficients and evaluated with an
+    FFT, at O(N log N) with no N×N edge tensor.
+  - Everything else is a 1×1 map.
+- **Gated connections.** A Fourier layer connects every cell to every other through one fixed
+  pattern. In the rhizome, the edge j → i is scaled by the receiver's gate A<sub>i</sub> and the
+  sender's gate B<sub>j</sub>. Both gates are recomputed from the state at each update, so the
+  effective connectivity changes as the field evolves (right: tree vs fixed global kernel vs
+  rhizome).
+- **Structured T<sub>b</sub> head.** The second output channel is a spin variable u, and
+  T<sub>b</sub> = x<sub>HI</sub> · A(z)(1+δ) · (1 − e<sup>u</sup>). The physical factor
+  `phys` = A(z)(1+δ) is an input, so the network only learns the spin-temperature part.
+- **Periodic transverse domain.** The FFT treats the transverse plane as periodic, which
+  matches 21cmFAST boxes. For non-periodic data (LoReLi lightcones) the plane is mirror-padded
+  and only the interior is scored.
 
-- **Conditioning `c`:** 13 channels of LOS density *bands* around the target
-  slice:
-  - single slices within ±3 native cells;
-  - band means over `[4,8)`, `[8,16)` and `[16,32)` cells on each side, about
-    ±46 Mpc at the cluster's 1.43 Mpc cells.
+Below, the learned kernel and gates of a checkpoint trained on toy lightcones, on a validation slice. The ring
+is the receiver cell on an ionization front. Panels (e–h) show how the gates re-weight its
+incoming connections over four updates:
 
-  Density enters as standardized `log(1+δ)`. The conditioning also includes
-  standardized `log(1+z)` and the 11 parameters mapped to [−1, 1] via AdaGN.
-- **Targets:** `2·x_HI − 1` and standardized `T_b`.
-- **Normalization:** from training cones only.
-- **Periodicity:** every convolution pads circularly, because transverse planes
-  come from periodic boxes. The energy is therefore exactly invariant to
-  transverse rolls by multiples of 4 (tested).
-- **Augmentation:** training uses the transverse dihedral group plus random
-  rolls.
+<p align="center">
+  <img src="docs/readme/mechanism.png" alt="Learned kernel, receiver and source gates, and gate re-weighting of the connections into one cell over four updates" width="88%">
+</p>
 
-### Noise schedule
+The equations, operator assumptions and the toy comparison with the additive local + Fourier
+baseline `RecurrentFNO2d` are in [docs/rhizome_operator.md](docs/rhizome_operator.md). The
+figures, their captions and what they do and do not show are in
+[docs/figures/README.md](docs/figures/README.md).
 
-Training draws log σ ~ N(−0.4, 1.4), covering about 0.04 ≤ σ ≤ 11 at ±2 std.
-EDM's image defaults, N(−1.2, 1.2), almost never train σ > 3. That is exactly
-the regime where a conditional sampler decides the *global* layout, i.e. which
-regions end up neutral and which ionized.
+The same law exists in other forms:
+- in 3-D on lightcone windows (`ebm21cm.model.rhizome3d`, non-periodic LOS);
+- with a compact real-space disc kernel (`radius=`);
+- with several gated pathways ([docs/rhizome_multipath.md](docs/rhizome_multipath.md)).
 
-On toy data those defaults gave a near-perfect denoiser at σ ≤ 1 but x_HI RMSE
-0.58 at σ = 10. The resulting samples were sharp but ignored the conditioning:
-the slice-mean x_HI was off by 0.2 on average. Changing where sampling starts
-(σ_max 40 → 5) did not help; training at high σ is what matters. Sampling
-starts at `train.sample_sigma_max = 10`, which lies inside the trained range.
+<br clear="right">
 
-On the same toy budget (5k steps), the new schedule lowered the fixed-grid
-validation loss at every checkpoint, e.g. 0.100 vs 0.126 at step 2500. It also
-put bubbles in the right places. The deterministic ODE sampler, however, still
-left pixel-level noise.
+## The 21cmFAST reference model
 
-A trajectory trace shows why. The state stays on-manifold
-(|x − D|/σ ≈ 1) down to σ ≈ 1. Below that, the ratio falls to about 0.65:
-pixel decisions go wrong where the denoiser is weakest, and the ODE cannot
-undo them.
+`runs/rhizome_mf2d_w64_structured_all` is the slice-wise multi-field model that every LoReLi
+experiment starts from.
 
-**Use stochastic sampling.** On 16 toy validation slices:
-
-| sampler | x_HI RMSE | hedged px | slice-mean error |
-|---|---|---|---|
-| ODE | 0.35 | 0.45 | 0.17 |
-| `--churn 40` | **0.23** | 0.19 | **0.06** |
-| `--churn 40` + `--mala-steps 4` | 0.26 | **0.13** | 0.07 |
-
-### Sampling
-
-The sampler is EDM Heun on the probability-flow ODE, with optional churn. With
-`--mala-steps k`, each step with `σ ≤ --mala-sigma-max` is followed by `k` MALA
-moves that target the model's own `p_σ ∝ exp(−E)`. Step sizes adapt towards a
-0.574 acceptance rate, so the corrector repairs predictor error. It is not a
-certified reversible chain.
-
-## Data
-
-`ebm21cm.data.lightcone.Lightcone` reads both on-disk schemas:
-
-| schema | layout | redshifts |
-|---|---|---|
-| `raw_v2` (cluster, `raw_lightcone_v2.0`) | `/lightcone/<field>`, `/params` attrs, `box_len_mpc` | stored |
-| `native` (`py21cmfast.LightCone.save`) | `/lightcones/<field>`, `/InputParameters/*` | recovered from `lightcone_distances` |
-
-Native files store no redshift axis. `cosmology.FlatLCDM` reproduces
-py21cmfast 4.x's astropy cosmology: Planck15 with T_cmb = 2.7255 K,
-m_ν = (0, 0, 0.06) eV, and the file's H0, Ωm and Ωb, with Neff = 3.044. It
-matches astropy to 1e-6 in z. Ignoring the massive neutrinos shifts z by about
-0.5 at z ≈ 34. The LOS axis is always presented in increasing-z order.
-
-### The slice cache
-
-The cache (`ebm21cm.data.cache`) has one row per (cone, native LOS index):
-
-- **Stored per row:** density bands, `x_HI`, `T_b`, `z`, parameters, cone id and
-  split, in physical units, float16 by default. Normalization lives in `/stats`.
-- **Splits** are assigned per simulation (seed 42, 80/10/10), before sharding.
-- **No invented padding:** indices whose bands would leave the cone are never
-  sampled.
-- **Rejected cones:** those with non-finite sampled slices, or a transverse
-  geometry different from the first file, are skipped and listed in the
-  `skipped` attribute.
-
-## Quickstart (local, toy data)
-
-The toy generator writes real-schema lightcones with sharp binary bubbles from a
-threshold-over-scales rule. It exists to test the pipeline, not as physics.
-
-```bash
-conda activate fno-env        # or any env with torch, h5py, scipy, matplotlib
-pip install -e .              # or: export PYTHONPATH=$PWD
-python -m ebm21cm.data.toy --out /tmp/toy/lc --n 80 --H 32
-python -m ebm21cm.data.cache build --data /tmp/toy/lc --out /tmp/toy/slices.h5 --slices-per-cone 32
-python -m ebm21cm.train --cache /tmp/toy/slices.h5 --run-dir /tmp/toy/run --config configs/toy.json
-python -m ebm21cm.sample --run-dir /tmp/toy/run --n-rows 32 --n-samples 8 --out /tmp/toy/run/samples.h5
-python -m ebm21cm.evaluate --samples /tmp/toy/run/samples.h5
-```
-
-## Cluster workflow
-
-Submit from the repository root. `slurm/_env.sh` activates `$CONDA_ENV`
-(default `fno-env`) and sets `WORK=/pfs/10/work/hd_id260-fno_training`.
-
-```bash
-mkdir -p logs
-AID=$(sbatch --parsable slurm/build_cache.sbatch)           # 33 shards, CPU
-sbatch --dependency=afterok:"$AID" slurm/merge_cache.sbatch  # + train-only stats
-sbatch --export=ALL,RUN_DIR=runs/base slurm/train.sbatch     # resubmit to resume
-sbatch --export=ALL,RUN_DIR=runs/base slurm/sample_eval.sbatch
-```
-
-- **Build:** `build_cache.sbatch` reads `LIGHTCONES` (default `$WORK/data/data`)
-  with `PATTERN=21cmfast_11d_sample*.h5`, `SLICES_PER_CONE=8` and z in
-  5.001–24.97.
-- **Size:** 6,600 cones × 8 slices × 15 stored 140² maps in float16 comes to
-  about 31 GB.
-- **Pilot first:** try the build on a subset with `--limit` on the command line
-  before the full array.
-- **Overrides:** `train.sbatch` accepts `CONFIG` and `OVERRIDES` (e.g.
-  `OVERRIDES="train.lr=1e-4 model.ch=96"`).
-
-## Evaluation
-
-`ebm21cm.sample` draws `M` samples per held-out slice, spread evenly in z, and
-records energies at several probe noise levels σ. `ebm21cm.evaluate` then
-reports, overall and per z-bin:
-
-| metric | what it tells you |
+| | |
 |---|---|
-| `*_rmse_sample` vs `*_rmse_mean` | a single sample is *expected* to have higher RMSE than the ensemble mean (≈√2 × at best); the mean plays the deterministic regressor |
-| `*_crps` | proper score for the ensemble; lower is better |
-| `*_spread_skill` | ≈ 1 when the ensemble spread is calibrated; < 1 over-confident |
-| `xhi_hedge_{truth,samples,mean}` | fraction of pixels with 0.1 < x_HI < 0.9; samples should match the truth, the mean should not |
-| P_pred/P_true, r(k) | samples should keep power at bubble scales where the mean loses it |
-| `bsd_w1_*` | Wasserstein distance of log MFP ionized-region sizes vs truth |
-| `dE_*` | [E(candidate) − E(truth)] per pixel at the same σ and conditioning |
+| conditioning | 26 channels: δ and the linear LOS velocity, each averaged over 13 LOS bands around the target slice (single cells within ±3, then [4,8), [8,16), [16,32) cells on each side; 1.4286 Mpc cells) |
+| scalars | 38: 1/(1+z), the 11 21cmFAST parameters, and the global x<sub>HI</sub> and T<sub>b</sub>/100 histories averaged over the same 13 bands. The histories come from parameter emulators, never from the cone itself |
+| physical factor | `phys` = A(z)(1+δ) in mK, for the structured T<sub>b</sub> head |
+| outputs | x<sub>HI</sub> (sigmoid) and T<sub>b</sub> |
+| grid | 140 × 140 periodic, 200 Mpc |
+| architecture | width 64, 24 Fourier modes, 6 updates, Δt = 0.5; 18.5 M parameters |
+| data | 6,567 21cmFAST cones (fno-21cm's multi-field split and normalization), 16 stratified + 2 background slices per cone (104,718 rows), z ≈ 5–25 |
+| objective | BCE(x<sub>HI</sub>) + MSE(normalized T<sub>b</sub>); Adam, learning rate halved on validation plateaus, stop at the floor (84k steps) |
+| test | x<sub>HI</sub> RMSE 0.087, T<sub>b</sub> RMSE 7.7 mK, BCE 0.132 |
 
-Figures: `examples.png`, `spectra.png`, `bubble_sizes.png`, `energy.png`.
+Build the slice cache from fno-21cm's preparation, then train and export:
 
-### Energy probe on other models' outputs
+```bash
+python -m ebm21cm.data.mf_all_prep --out $WORK/data/compressed/preparation_mf_all_raw.json
 
-`--candidates preds.h5` (datasets `row`, `xhi`, `tb`, with `row` = cache row id)
-adds any external prediction, e.g. an `fno-21cm` output resampled to the same
-slice, to the energy probe. `dE > 0` means the model finds the truth more
-plausible than the candidate. Energies are only comparable at the **same σ and
-conditioning**. Clean fields get fixed-seed probe noise at that σ before
-evaluation, since `E(·; σ)` is trained on noised inputs.
+# one shard per array task (CLEAN_TB=1: fno-21cm's T_b cleaning on the raw files), then merge
+export PREPARATION=$WORK/data/compressed/preparation_mf_all_raw.json CLEAN_TB=1 \
+       SLICES_PER_CONE=16 BACKGROUND_SLICES=2 \
+       SHARD_DIR=$WORK/data/compressed/rhizome_mf_slices_all_shards \
+       CACHE=$WORK/data/compressed/rhizome_mf_slices_all.h5
+AID=$(sbatch --parsable --export=ALL slurm/build_mf_slices.sbatch)
+sbatch --dependency=afterok:$AID --export=ALL,MODE=merge slurm/build_mf_slices.sbatch
+
+ARGS="--width 64 --batch-size 32 --head structured" \
+    sbatch --export=ALL,RUN_DIR=runs/rhizome_mf2d_w64_structured_all slurm/train_rhizome_mf2d.sbatch
+
+# restack slices into cones on fno-21cm's eval grid (+ native cylindrical power)
+python -m ebm21cm.export_slicewise_mf --run runs/rhizome_mf2d_w64_structured_all \
+    --reference $CUBES/rhizome3d_mf_C/manifest.json --tag rhizome2d_mf_w64_all --out-dir $CUBES
+```
+
+## Transfer to LoReLi II
+
+LoReLi II (Meriot, Semelin & Cornu 2024) is a grid of about 10,000 Licorice simulations:
+N-body, SPH and Monte-Carlo radiative transfer. It has five astrophysical parameters (f<sub>X</sub>, τ,
+r<sub>H/S</sub>, M<sub>min</sub>, f<sub>esc</sub>) and no counterpart to 21cmFAST's eleven. The transfer
+uses 228 five-field lightcones (128² × 1536 planes over 294 Mpc, z = 5–15) and 7,942
+T<sub>b</sub>-only lightcones.
+
+**1. Adapter** (`ebm21cm/data/loreli.py`, `ebm21cm/model/remap.py`). A LoReLi cone becomes
+exactly the tensors the reference model expects:
+- **Transverse:** 128 cells are resampled to 206 cells of 1.4286 Mpc and mirror-padded to
+  280 cells (400 Mpc).
+- **Kernel:** the spectral kernel is re-indexed from 24 to 48 modes so that it acts at the
+  same physical wavenumbers. On a tiled periodic field this is exact to 4·10<sup>-6</sup>.
+- **LOS:** the line of sight is **uniform in redshift**, not in comoving distance. This was
+  verified against the 21ssd box histories, and the planes are 3.5 Mpc apart at z = 5 and
+  0.8 Mpc at z = 15.
+- **Velocity:** reconstructed from δ in linear theory.
+
+**2. History emulator** (`ebm21cm/data/loreli_globals.py`, `ebm21cm/loreli_history.py`). The
+parameter slots stay at the training mean, so the history scalars are the model's only
+astrophysical input.
+- **The leak:** feeding a cone's own slice-mean history leaks the answer (RMS 6·10<sup>-6</sup>
+  against the target slice).
+- **The emulator:** ensembles of MLPs on the five parameters predict the x<sub>HI</sub> and
+  T<sub>b</sub> histories. Held out, the errors are x<sub>HI</sub> RMS 0.0033 and
+  T<sub>b</sub> 4.0 mK.
+- **Training without the leak:** training cones get out-of-fold histories. The history error
+  the model then sees, 0.037, matches its 21cmFAST training (0.042).
+
+<p align="center">
+  <img src="docs/readme/loreli_history_emulator.png" alt="History emulator on four held-out LoReLi simulations: x_HI and T_b histories, box/lightcone truth vs emulator" width="92%">
+</p>
+
+**3. Slice cache** (`ebm21cm/data/loreli_cache.py`, `slurm/build_loreli_cache.sbatch`). The
+cache is built with the evaluation adapter, so a training row is bit-identical to what the
+model sees at evaluation.
+- **Rows:** every slice with 0.02 ≤ x<sub>HI</sub> ≤ 0.98, plus background slices.
+- **Masking:** loss and metrics use only the 206 × 206 interior.
+- **Splits** (`scripts/loreli_block_split.py`): 60 parameter blocks, 44 train / 8 val / 8 test.
+  A block is a group of simulations that differ only in r<sub>H/S</sub>, so holding one out
+  holds out a parameter combination.
+- **Files:** `data/compressed/loreli_slices_l294_v3.h5` plus the emulated-history side file
+  `loreli_slices_l294_v3_emuhist.h5`.
+
+<p align="center">
+  <img src="docs/readme/loreli_cache_slices.jpg" alt="One LoReLi training cone at four stages: target x_HI, T_b, density band, LOS velocity band, physical factor" width="92%">
+</p>
+
+**4. Fine-tuning ladder** (`ebm21cm/train_loreli_finetune.py`, `ebm21cm/model/freeze.py`,
+`scripts/loreli_ladder.sh 8|44`). Five arms unfreeze progressively more of the reference
+model:
+
+| arm | trainable | question |
+|---|---|---|
+| `decoder` | output layer incl. the structured T<sub>b</sub> head (4.3 k) | is an output recalibration enough? |
+| `ends` | + input lift and scalar embedding (8.5 k) | does it need to re-read its inputs? |
+| `pointwise` | + gates, value, proposal of every update (46 k); kernel frozen | does the local response change, with spatial transport kept? |
+| `none` | everything (18.5 M; kernel at lr 10<sup>-4</sup>) | full fine-tuning |
+| `scratch` | everything, random initialization | what LoReLi alone gives |
+
+**Results** on the 30 test cones, emulated histories, scored with [21cmEVAL](https://github.com/thekaharis/21cmEVAL)
+(pooled RMSE; IoU of ionized regions at the true ionized fraction):
+
+| model | x<sub>HI</sub> RMSE | T<sub>b</sub> RMSE [mK] | IoU |
+|---|---|---|---|
+| reference, zero-shot | 0.177 | 15.0 | 0.733 |
+| 8 blocks, `decoder` | 0.119 | 11.8 | 0.801 |
+| 8 blocks, `pointwise` | 0.101 | 11.2 | 0.846 |
+| 8 blocks, `scratch` | 0.106 | 11.5 | 0.844 |
+| 44 blocks, `decoder` | 0.116 | 11.3 | 0.801 |
+| 44 blocks, `ends` | 0.107 | 11.1 | 0.821 |
+| 44 blocks, `pointwise` | 0.084 | 10.7 | 0.853 |
+| 44 blocks, `none` | 0.085 | 10.6 | 0.854 |
+| 44 blocks, `scratch` | 0.087 | 10.7 | 0.851 |
+| 44 blocks, `none`, oracle histories | 0.081 | 10.4 | 0.865 |
+
+What the ladder shows:
+- **The kernel transfers.** Training only the pointwise maps with the 21cmFAST kernel frozen
+  matches full fine-tuning.
+- **Recalibration is not enough.** Decoder-only and ends-only adaptation fall well short.
+- **Pretraining helps only with little data.** With 44 blocks a model trained from scratch
+  gets almost the same scores; with 8 blocks the pretrained arms are ahead.
+- **The emulator costs little.** Emulated histories cost about 0.004 in x<sub>HI</sub> RMSE
+  against the oracle.
+- **Caveat:** each arm is one seed.
+
+Test cone 12316, truth vs zero-shot reference vs 8-block `pointwise` (x<sub>HI</sub> and T<sub>b</sub>, residuals, slice RMSE):
+
+<p align="center">
+  <img src="docs/readme/loreli_gallery_cone12316.jpg" alt="Gallery of test cone 12316 at four ionization stages: x_HI and T_b truth, reference, fine-tuned, residuals" width="100%">
+</p>
+
+The data intricacies are described in the LoReLi integration report (1 Nov 2026, written
+before the axis fix; not in the repository) and in
+`$WORK/data/loreli_lc128/README_loreli_lc128.md`. They include the empty low-z tails, corrupt
+planes, the pruned public set, 294 vs 300 Mpc and the missing RSD term. Every LoReLi figure and its rebuild command are listed in
+[docs/figures/loreli/README.md](docs/figures/loreli/README.md).
+
+## Evaluation and figures
+
+- **[21cmEVAL](https://github.com/thekaharis/21cmEVAL)** (`eval21`) is the evaluation and plotting
+  library for both 21cmFAST and LoReLi results. Its metrics are voxel, power spectrum,
+  cylindrical power, bubble sizes, history, the 21-cm observable, EFT, fronts and
+  morphology, with matching figures.
+  - The LoReLi pipeline is `scripts/loreli_cm21eval_{predict,run,merge}.py` and
+    `slurm/loreli_cm21eval.sbatch`.
+  - It predicts full test cones in four redshift groups, scores x<sub>HI</sub> and
+    T<sub>b</sub>, and stages T<sub>b</sub> by the true x<sub>HI</sub>.
+- **`ebm21cm.evaluate_loreli_finetune`** gives test-split metrics (BCE, RMSE, score per stage)
+  for any ladder run or the remapped reference. It runs automatically after each ladder arm.
+- **Repository viz tools.** They read `eval_cubes` manifests, which
+  `export_slicewise_mf` and `scripts/loreli_export_eval_cubes.py` produce:
+  - `native_cyl` + `plot_cyl_error`: cylindrical power error P<sub>pred</sub>/P<sub>true</sub> − 1 at
+    native LOS resolution, in stage-matched chunks;
+  - `compare_cones3d`: per-cone gallery;
+  - `delta_slices`: prediction − truth per stage;
+  - `suite_cached`: fno-21cm's 3-D suite, cached per model.
+
+## Repository layout
+
+```text
+ebm21cm/
+├── model/
+│   ├── rhizome.py             RhizomeOperator2d, interaction law, disc/multi-path variants
+│   ├── rhizome3d.py           3-D rhizome on lightcone windows
+│   ├── recurrent.py           RecurrentFNO2d baseline, spectral convolution
+│   ├── remap.py               run a trained spectral model on a larger domain
+│   └── freeze.py              parameter groups of the fine-tuning ladder
+├── data/
+│   ├── mf_all_prep.py, mf_slices.py         21cmFAST multi-field slice cache (fno-21cm preparation)
+│   ├── loreli.py                            LoReLi cone reader and model adapter
+│   ├── loreli_globals.py                    per-simulation parameters and global histories
+│   ├── loreli_cache.py, loreli_memory.py    LoReLi slice cache, in-RAM / on-disk splits
+│   └── lightcone.py, cache.py, toy.py       raw 21cmFAST reader, original slice cache, toy cones
+├── train_rhizome_mf2d.py      train the slice-wise multi-field model
+├── train_rhizome.py           resumable single-field training with a plateau stopping rule
+├── train_rhizome3d.py         3-D rhizome on fno-21cm LOS windows
+├── train_loreli_finetune.py   LoReLi fine-tuning (ladder arms)
+├── loreli_history.py          LoReLi history emulator and scalar side file
+├── evaluate_loreli.py, evaluate_loreli_finetune.py, loreli_inference.py
+├── export_slicewise_mf.py     restack slices into cones (eval_cubes) + native cylindrical power
+└── native_cyl.py, plot_cyl_error.py, compare_cones3d.py, delta_slices.py, suite_cached.py, ...
+scripts/   LoReLi ladder, splits, 21cmEVAL pipeline, figure scripts
+slurm/     sbatch wrappers (source slurm/_env.sh)
+docs/      design notes, studies, figures (docs/figures/README.md, docs/figures/loreli/README.md)
+tests/
+```
+
+## Cluster
+
+Runs are on bwForCluster BINAC 2. Submit from the repository root; `slurm/_env.sh` activates
+`$CONDA_ENV` (default `fno-env`) and sets `WORK=/pfs/10/work/hd_id260-fno_training`. Caches live in
+`$WORK/data/compressed/`, run outputs in `runs/` (git-ignored). Several modules import fno-21cm
+(`--fno-root`) for its preparation, emulators and evaluation suite.
+
+```bash
+pip install -e .        # or: export PYTHONPATH=$PWD
+```
 
 ## Tests
 
 ```bash
-python -m pytest -q
+python -m pytest -q     # 229 tests
 ```
 
-The suite covers:
+The tests cover:
+- the interaction law: the FFT interaction against the dense integral, a single spatial
+  interaction path, roll equivariance, and the disc and multi-path kernels;
+- the 3-D LOS padding and the structured T<sub>b</sub> head;
+- the spectral remap;
+- the LoReLi pieces:
+  - the uniform-z axis and the adapter (numpy against torch);
+  - cache rows against the evaluation inputs;
+  - the history emulator's side-file row check;
+  - the ladder's parameter groups and disk storage;
+- long-training resume;
+- the original EBM data and model checks.
 
-- **Data:** schema agreement, LOS reversal, py21cmfast cosmology, the cache
-  against the source files, train-only stats, and shard/merge equivalence.
-- **Model:** score = −∇E by finite differences, per-sample energies and roll
-  invariance.
-- **Sampling:** determinism and MALA bounds.
-- **Metrics:** CRPS against brute force, calibrated spread/skill, white-noise
-  P(k), and MFP on a disk.
-- **End to end:** train → resume → sample → evaluate on toy data.
+## Documentation
 
-## Limitations
+| | |
+|---|---|
+| [rhizome_operator.md](docs/rhizome_operator.md) | interaction law, assumptions, toy comparison with the additive baseline |
+| [rhizome_long_training.md](docs/rhizome_long_training.md) | plateau stopping rule, resumable training |
+| [rhizome_multipath.md](docs/rhizome_multipath.md) | multi-pathway interaction, disc kernel by FFT |
+| [rhizome_ablation_study.md](docs/rhizome_ablation_study.md) | planned gate / sharing / transfer ablations |
+| [rhizome3d_review.md](docs/rhizome3d_review.md) | review of the 3-D implementation (LOS padding, aliasing) |
+| [rhizome_literature_review.md](docs/rhizome_literature_review.md) | positioning against prior work (AFT, Hyena/H3, FNO) |
+| [darcy_width8.md](docs/darcy_width8.md) | Darcy-flow test at hidden width 8 |
+| [recurrent_operator.md](docs/recurrent_operator.md) | the additive local + Fourier baseline |
+| [figures/README.md](docs/figures/README.md), [figures/loreli/README.md](docs/figures/loreli/README.md) | paper and LoReLi figures, captions, rebuild commands |
+| [ebm.md](docs/ebm.md) | the original energy-based model |
 
-- **2-D slices.** LOS context beyond ±32 cells is not seen, and neighbouring
-  slices are sampled independently, so a stack of samples is not a consistent
-  3-D cone.
-- **Plain (no-RSD) fields only.**
-- **Single GPU.** DDP is untested with the double backward.
-- **fp16 storage.** The cache stores fp16 (T_b resolution ~0.03 mK at 30 mK);
-  use `--dtype float32` if that matters.
-- **Toy data.** It checks mechanics and the sharpness claim qualitatively; it
-  says nothing about accuracy on 21cmFAST.
+## Other code
+
+- **The energy-based generative model** this repository began with: an EDM U-Net energy,
+  denoising score matching and MALA sampling (`ebm21cm.train`, `sample`, `evaluate`,
+  `model/energy.py`, `model/unet.py`). It is documented in [docs/ebm.md](docs/ebm.md) and is
+  not developed further.
+- **Comparisons with fno-21cm models** (`compare_fno*.py`), benchmarks (`bench_*.py`) and
+  diagnostics (`rollout_diagnostic.py`, `mechanism_*.py`, `mode_weights.py`).

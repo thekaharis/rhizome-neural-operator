@@ -50,6 +50,14 @@ def lattice(n_cells, n_nodes):
     return np.stack([yy.ravel(), xx.ravel()], 1), step
 
 
+def curved(p, q, bend):
+    """Quadratic Bezier from p to q (x, y), bowed sideways by ``bend`` of its length."""
+    m = (p + q) / 2
+    d = q - p
+    ctrl = m + bend * np.array([-d[1], d[0]])
+    return MPath([p, ctrl, q], [MPath.MOVETO, MPath.CURVE3, MPath.CURVE3])
+
+
 def fans(ax, nodes, weights, receivers, n, color, scale, thresh=0.1):
     """Incoming edges w[r, j] / scale into each receiver r, lightest drawn first."""
     order = []
@@ -65,7 +73,7 @@ def fans(ax, nodes, weights, receivers, n, color, scale, thresh=0.1):
                 order.append((wt, j, r))
     order.sort()
     rgb = matplotlib.colors.to_rgb(color)
-    paths = [MPath([nodes[j][::-1].astype(float), nodes[r][::-1].astype(float)])
+    paths = [curved(nodes[j][::-1].astype(float), nodes[r][::-1].astype(float), 0.09 * (1 if j % 2 else -1))
              for _, j, r in order]
     ax.add_collection(PathCollection(
         paths, facecolors="none", capstyle="round", zorder=2,
@@ -178,7 +186,7 @@ def main():
         "text.usetex": True, "font.family": "serif", "font.size": 8, "axes.titlesize": 8.5,
         "text.latex.preamble": r"\usepackage{amsmath}\usepackage{bm}",
     })
-    fig, axes = plt.subplots(1, 3, figsize=(7.0, 2.85), constrained_layout=True)
+    fig, axes = plt.subplots(3, 1, figsize=(3.4, 9.3), constrained_layout=True)
 
     background(axes[0], truth, n)
     tree_panel(axes[0], n, int(np.log2(args.nodes)), (float(nodes[rx][1]), float(nodes[rx][0])),

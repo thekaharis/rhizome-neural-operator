@@ -1,6 +1,7 @@
 #!/bin/bash
 # x_HI + T_b cones from the multi-field 2-D slice-wise rhizome (RUN), mirroring a
 # multi-field eval_cubes manifest (REFERENCE); NATIVE_CONES optional.
+# EXTRA: further export_slicewise_mf arguments (e.g. --native-cyl PREFIX --cyl-only).
 #   sbatch --export=ALL,RUN=runs/rhizome_mf2d_w64_structured,TAG=rhizome2d_mf_w64,REFERENCE=.../manifest.json slurm/export_slicewise_mf.sbatch
 #SBATCH --job-name=rhz-slicewise-mf
 #SBATCH --partition=gpu
@@ -16,4 +17,4 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_env.sh" 2>/dev/null || source slurm/_env.sh
 nvidia-smi -L || true
 python -m ebm21cm.export_slicewise_mf --run "${RUN:?set RUN}" --reference "${REFERENCE:?set REFERENCE}" \
-    --tag "${TAG:?set TAG}" --out-dir "${OUT_DIR:-$WORK/data/eval_cubes}" ${NATIVE_CONES:+--native-cones $NATIVE_CONES} ${NATIVE_ONLY:+--native-only}
+    --tag "${TAG:?set TAG}" --out-dir "${OUT_DIR:-$WORK/data/eval_cubes}" ${NATIVE_CONES:+--native-cones $NATIVE_CONES} ${NATIVE_ONLY:+--native-only} ${EXTRA:-}

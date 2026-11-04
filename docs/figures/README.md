@@ -6,9 +6,12 @@
 | `rhizome_mechanism.pdf` | Learned kernel, gates and gate re-weighting of a trained checkpoint | `scripts/make_rhizome_mechanism.py` |
 | `rhizome_network.pdf` | How cells exchange information: tree (U-Net), fixed global kernel, rhizome | `scripts/make_rhizome_network.py` |
 
-PNG copies (2400 px / 300 dpi) are for slides; use the PDFs in LaTeX. All
-figures are sized for a full text width of about 7 in (`\textwidth` in a
-two-column layout, or `\linewidth` in a single-column thesis).
+PNG copies (300 dpi) are for slides; use the PDFs in LaTeX. The architecture
+and mechanism figures are sized for a full text width of about 7 in
+(`\textwidth` in a two-column layout, or `\linewidth` in a single-column
+thesis). The network figure stacks its three panels vertically at 3.4 × 9.3 in,
+one column wide; in a single-column thesis place it as a full-height figure or
+beside text with `wrapfigure`.
 
 ## Rebuild
 

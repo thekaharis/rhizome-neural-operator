@@ -54,6 +54,8 @@ class SpectralConv2d(nn.Module):
         h, w = x.shape[-2:]
         if min(h, w) < 2 * self.modes:
             raise ValueError(f"both grid dimensions must be >= 2*modes={2 * self.modes}, got {(h, w)}")
+        if x.dtype in (torch.float16, torch.bfloat16):
+            x = x.float()  # mixed precision: the FFT and spectral weights stay float32
         if x.dtype not in (torch.float32, torch.float64):
             raise ValueError("Fourier inputs must use float32 or float64")
         spectrum = torch.fft.rfft2(x, norm="ortho")
