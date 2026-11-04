@@ -45,14 +45,14 @@ python docs/figures/loreli/src/make_loreli_test_predictions.py \
     docs/figures/loreli/loreli_v3_b8_decoder_test_predictions.png
 ```
 
-The `cm21eval_viz/` sets come from 21cmEVAL itself (`cm21eval plot`, ~2 min on a compute node). The
+The `cm21eval_viz/` sets come from 21cmEVAL itself (`eval21 plot`, ~2 min on a compute node). The
 `cylindrical` and `gallery` metrics run as an extra pass next to the full one (merged by the plots):
 
 ```bash
 export XHI_METRICS=cylindrical,gallery TB_METRICS=cylindrical,gallery
 export EXTRA="--set omega_m=0.308 --set cyl_native_cell_mpc=2.296875 --set cyl_native_los_dz=0.0065146580 --set gallery_samples=100"
 MODELS=<m> OUT=runs/cm21eval/<m>/viz sbatch --export=ALL slurm/loreli_cm21eval.sbatch     # ~3 min per model
-PYTHONPATH=$HOME/21cmEVAL/src python -m cm21eval plot all --run runs/cm21eval \
+PYTHONPATH=$HOME/21cmEVAL/src python -m eval21 plot all --run runs/cm21eval \
     --out docs/figures/loreli/cm21eval_viz/ref_vs_b8_pointwise --models reference,b8_pointwise \
     --style docs/figures/loreli/src/cm21eval_style.json --title "LoReLi II v3 test"
 ```

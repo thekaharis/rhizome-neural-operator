@@ -225,7 +225,7 @@ for gname, gr in groups.items():
     manifest = {"box_mpc": l_perp, "omega_m": 0.308, "inputs": ["density"], "samples": samples,
                 "group": gname, "window": check["windows"][gname], "cell_mpc": l_perp / n_out,
                 "source": {"cones": a.data, "cache": a.cache, "builder": "LoreliAdapter(velocity=linear), float16 cond"},
-                "note": "target not set on purpose: cm21eval --target xhi|tb (+ --set target=...)"}
+                "note": "target not set on purpose: eval21 --target xhi|tb (+ --set target=...)"}
     gdir = Path(a.truth_root) / gname
     (gdir / "manifest.json").write_text(json.dumps(manifest, indent=1))
     (gdir / "manifest_tb.json").write_text(json.dumps({**manifest, "inputs": ["density", "xhi"]}, indent=1))

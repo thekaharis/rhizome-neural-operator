@@ -5,7 +5,7 @@
 21cmEVAL bins slices into reionization stages by the slice mean of the *target*.  For a T_b
 target that would bin by T_b.  When the sample carries the true x_HI as an input
 (``manifest_tb.json`` declares inputs [density, xhi]), every stage mask is computed from the
-x_HI slice means instead.  For the x_HI pass nothing changes.  Other arguments go to cm21eval.
+x_HI slice means instead.  For the x_HI pass nothing changes.  Other arguments go to eval21.
 
 (``--target`` alone only reaches the data loader; ``Settings.target`` needs ``--set target=...``.)
 """
@@ -13,9 +13,9 @@ import importlib
 import sys
 
 import numpy as np
-import cm21eval.physics as physics
-import cm21eval.metrics.base as base
-from cm21eval.cli import main
+import eval21.physics as physics
+import eval21.metrics.base as base
+from eval21.cli import main
 
 _current = {}
 _stage_masks = physics.stage_masks
@@ -37,7 +37,7 @@ def stage_masks(xbar, stage_edges, active_range, min_slices=1):
 
 base.Metric.target = target
 for mod in ("physics", "metrics.base", "metrics.spectrum", "metrics.eft", "metrics.observable"):
-    m = importlib.import_module(f"cm21eval.{mod}")
+    m = importlib.import_module(f"eval21.{mod}")
     if hasattr(m, "stage_masks"):
         m.stage_masks = stage_masks
 sys.exit(main(sys.argv[1:]))
