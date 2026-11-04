@@ -26,7 +26,10 @@ def __getattr__(attr):
     def predict(sample):
         with np.load(EVAL_CUBES / tag / f"{sample.id}.npz") as d:
             z = d["z_native"] if "z_native" in d.files else d.get("z_grid")
-            if z is not None and sample.meta.z_grid is not None and not np.allclose(z, sample.meta.z_grid):
+            # ``z_native`` holds the native plane redshifts behind the nominal eval grid (within ~0.01);
+            # a different grid would be off by far more than that
+            if z is not None and sample.meta.z_grid is not None and (
+                    len(z) != len(sample.meta.z_grid) or not np.allclose(z, sample.meta.z_grid, atol=0.05)):
                 raise ValueError(f"{tag}/{sample.id}: prediction z grid differs from the sample's")
             return {"xhi": d["pred"].astype(np.float32), "tb": d["tb_pred"].astype(np.float32)}
     predict.__name__ = attr

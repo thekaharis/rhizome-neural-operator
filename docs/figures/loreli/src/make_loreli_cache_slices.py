@@ -50,6 +50,8 @@ def main():
     bands = json.loads(h.attrs["bands"])
     if mf:
         n, pad = h["xhi"].shape[-1], 0
+        tbn = json.loads(h.attrs["normalization"])["brightness_temp"]     # tb is stored normalized
+        off, scale = float(tbn["offset"]), float(tbn["scale"])
         cone = args.cone if args.cone is not None else \
             int(h["cone_id"][:][np.flatnonzero(h["split"][:] == SPLITS[args.split])[0]])
         split_name = {v: k for k, v in SPLITS.items() if k != "validation"}[int(h["split"][:][h["cone_id"][:] == cone][0])]
@@ -84,7 +86,7 @@ def main():
         r = rows[k]
         if mf:
             xhi = np.asarray(h["xhi"][r], np.float32)
-            tb = np.asarray(h["tb"][r], np.float32)
+            tb = np.asarray(h["tb"][r], np.float32) * scale + off
         else:
             tgt = h["target"][r][(slice(None),) + sl].astype(np.float32)
             xhi, tb = tgt[0], tgt[1] * scale + off
