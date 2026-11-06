@@ -31,7 +31,8 @@ def __getattr__(attr):
             if z is not None and sample.meta.z_grid is not None and (
                     len(z) != len(sample.meta.z_grid) or not np.allclose(z, sample.meta.z_grid, atol=0.05)):
                 raise ValueError(f"{tag}/{sample.id}: prediction z grid differs from the sample's")
-            return {"xhi": d["pred"].astype(np.float32), "tb": d["tb_pred"].astype(np.float32)}
+            return {"xhi": d["pred"].astype(np.float32),
+                    **({"tb": d["tb_pred"].astype(np.float32)} if "tb_pred" in d.files else {})}
     predict.__name__ = attr
     return predict
 
