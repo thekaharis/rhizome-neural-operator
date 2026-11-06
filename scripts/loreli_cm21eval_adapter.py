@@ -22,7 +22,9 @@ def __getattr__(attr):
         raise AttributeError(attr)
     name = attr[len("predict_"):]
     if not (PREDS / name).is_dir():
-        raise FileNotFoundError(f"no predictions for model {name!r} under {PREDS}")
+        # AttributeError, not FileNotFoundError: eval21 probes optional hooks
+        # (getattr(module, "predict_draws", None)) and must see "absent".
+        raise AttributeError(f"no predictions for model {name!r} under {PREDS}")
     _names.append(name)
 
     def predict(sample):
